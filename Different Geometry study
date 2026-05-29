@@ -1,0 +1,1006 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from datetime import datetime
+from matplotlib.ticker import MaxNLocator
+from scipy.sparse.linalg import spsolve
+from scipy.sparse import csr_matrix
+
+
+# ============================================================
+# OUTPUT FOLDER
+# ============================================================
+DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+OUTPUT_DIR = os.path.join(
+    DOWNLOADS_DIR,
+    "PCL6800_Thickness_Geometry_Study_Fixed_Parameters"
+)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"Results will be saved in:\n{OUTPUT_DIR}")
+
+
+# ============================================================
+# 0) FIXED PCL6800 PARAMETERS — NO CALIBRATION
+# ============================================================
+THETA_FIXED = np.array([
+    0.70,      # k1
+    5.5,       # k3
+    0.22,      # k_conv
+    0.20,      # k_deg_C
+    2.7,       # k_deg_A
+    9000.0,    # Mnc
+    3.1,       # k_det
+    36.0,      # D_E_intact
+    2.1,       # D_E_void_ratio
+    32.0,      # D_O_poly
+    45.0       # D_O_void_ratio
+], dtype=float)
+
+
+# ============================================================
+# 1) PCL6800 INITIAL PROPERTIES
+# ============================================================
+MN0 = 40931.18
+X_FIXED = 0.60
+
+
+# ============================================================
+# 2) REFERENCE GEOMETRY AND REFINEMENT CONTROL
+# ============================================================
+REF_LENGTH_MM = 30.0
+REF_THICKNESS_MM = 0.3
+
+REF_ROWS = 10
+REF_COLS = 333
+
+# Change only this to refine the grid.
+# TARGET_ROWS = 10 gives reference 10 x 333.
+# TARGET_ROWS = 20 gives reference 20 x 666.
+# TARGET_ROWS = 30 gives reference 30 x 999.
+TARGET_ROWS = 30
+
+REFINEMENT_FACTOR = TARGET_ROWS / REF_ROWS
+
+
+# ============================================================
+# 3) GEOMETRIES TO COMPARE
+# ============================================================
+GEOMETRY_CASES = [
+    {"name": "Reference_30x10x0p3mm", "type": "Slab", "length_mm": 30.0, "thickness_mm": 0.3},
+    {"name": "Slab_30x10x0p5mm",     "type": "Slab", "length_mm": 30.0, "thickness_mm": 0.5},
+    {"name": "Slab_30x10x1p0mm",     "type": "Slab", "length_mm": 30.0, "thickness_mm": 1.0},
+    {"name": "Slab_30x10x2p0mm",     "type": "Slab", "length_mm": 30.0, "thickness_mm": 2.0},
+    {"name": "Slab_30x10x5p0mm",     "type": "Slab", "length_mm": 30.0, "thickness_mm": 5.0},
+    {"name": "Slab_30x10x10p0mm",    "type": "Slab", "length_mm": 30.0, "thickness_mm": 10.0},
+]
+
+
+# ============================================================
+# 4) MODEL CONSTANTS
+# ============================================================
+DT = 0.05
+T_END = 20.0
+
+S_CRYST = 1
+S_AMORPH = 0
+S_DEG = 2
+S_VOID = -1
+
+ORIGIN_NONE = 0
+ORIGIN_C = 1
+ORIGIN_A = 2
+
+E_BATH = 1.0
+O_BATH = 0.0
+
+PHI_WINDOW = 1
+M_SOL = 8
+M0_REPEAT = 114.14
+
+SEED = 42
+N_REP = 3
+SEEDS = [SEED + i for i in range(N_REP)]
+
+ENZYME_NEIGHBOUR_THRESHOLD = 1e-12
+
+ROWS = None
+COLS = None
+DX = 1.0
+
+
+# ============================================================
+# 5) GEOMETRY TO GRID CONVERSION
+# ============================================================
+def set_geometry_grid(length_mm, thickness_mm):
+    global ROWS, COLS, DX
+
+    rows_float = REF_ROWS * (thickness_mm / REF_THICKNESS_MM) * REFINEMENT_FACTOR
+    cols_float = REF_COLS * (length_mm / REF_LENGTH_MM) * REFINEMENT_FACTOR
+
+    ROWS = max(3, int(round(rows_float)))
+    COLS = max(3, int(round(cols_float)))
+
+    # DX changes only when TARGET_ROWS changes.
+    DX = 1.0 / REFINEMENT_FACTOR
+
+    return ROWS, COLS, DX
+
+
+# ============================================================
+# 6) POROSITY-DEPENDENT DIFFUSIVITY
+# ============================================================
+def compute_porosity_field(phase, window):
+    void_only = (phase == S_VOID).astype(float)
+    ny, nx = phase.shape
+    phi = np.zeros_like(void_only, dtype=float)
+
+    pad = max(int(window), 1)
+
+    padded_void = np.pad(
+        void_only,
+        pad_width=pad,
+        mode="constant",
+        constant_values=1.0
+    )
+
+    w = 2 * pad + 1
+
+    for dj in range(-pad, pad + 1):
+        for di in range(-pad, pad + 1):
+            phi += padded_void[
+                pad + dj:pad + dj + ny,
+                pad + di:pad + di + nx
+            ]
+
+    phi /= float(w * w)
+    return phi
+
+
+def effective_diffusivity(phi, D_intact, D_void_ratio):
+    return D_intact * (1.0 + (D_void_ratio - 1.0) * phi)
+
+
+# ============================================================
+# 7) DIFFUSION PDE
+# ============================================================
+def build_diffusion_matrix(D_field, dt, dx, bath_value):
+    ny, nx = D_field.shape
+
+    n_solve_rows = ny - 2
+    n_solve_cols = nx - 2
+
+    if n_solve_rows <= 0 or n_solve_cols <= 0:
+        raise ValueError("ROWS and COLS must both be at least 3.")
+
+    N = n_solve_rows * n_solve_cols
+
+    def idx(j, i):
+        return (j - 1) * n_solve_cols + (i - 1)
+
+    rows, cols, vals = [], [], []
+    rhs_extra = np.zeros(N)
+
+    for j in range(1, ny - 1):
+        for i in range(1, nx - 1):
+            k = idx(j, i)
+            diag_val = 1.0
+
+            for dj, di in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                jj, ii = j + dj, i + di
+
+                D_face = 0.5 * (D_field[j, i] + D_field[jj, ii])
+                coef = dt * D_face / dx**2
+
+                if jj == 0 or jj == ny - 1 or ii == 0 or ii == nx - 1:
+                    rhs_extra[k] += coef * bath_value
+                else:
+                    rows.append(k)
+                    cols.append(idx(jj, ii))
+                    vals.append(-coef)
+
+                diag_val += coef
+
+            rows.append(k)
+            cols.append(k)
+            vals.append(diag_val)
+
+    A = csr_matrix((vals, (rows, cols)), shape=(N, N))
+    return A, rhs_extra
+
+
+def diffuse_field(field, phase, D_intact, D_void_ratio, dt, dx, bath_value):
+    ny, nx = field.shape
+
+    phi = compute_porosity_field(phase, window=PHI_WINDOW)
+    D_field = effective_diffusivity(phi, D_intact, D_void_ratio)
+
+    A, rhs_extra = build_diffusion_matrix(
+        D_field,
+        dt,
+        dx,
+        bath_value=bath_value
+    )
+
+    rhs = field[1:-1, 1:-1].flatten() + rhs_extra
+    internal_new = spsolve(A, rhs).reshape(ny - 2, nx - 2)
+
+    out = field.copy()
+
+    out[0, :] = bath_value
+    out[-1, :] = bath_value
+    out[:, 0] = bath_value
+    out[:, -1] = bath_value
+    out[1:-1, 1:-1] = internal_new
+
+    np.clip(out, 0.0, None, out=out)
+    return out
+
+
+def diffuse_E(E_field, phase, D_E_intact, D_E_void_ratio, dt, dx):
+    return diffuse_field(
+        E_field,
+        phase,
+        D_E_intact,
+        D_E_void_ratio,
+        dt,
+        dx,
+        E_BATH
+    )
+
+
+def diffuse_oligomer(O_field, phase, D_O_poly, D_O_void_ratio, dt, dx):
+    return diffuse_field(
+        O_field,
+        phase,
+        D_O_poly,
+        D_O_void_ratio,
+        dt,
+        dx,
+        O_BATH
+    )
+
+
+# ============================================================
+# 8) CHAIN-LENGTH FUNCTIONS
+# ============================================================
+def recalc_Mn_from_Nk_cell(Nk_cell):
+    k_vals = np.arange(Nk_cell.size, dtype=float)
+    total_units = np.sum(k_vals * Nk_cell)
+    total_chains = np.sum(Nk_cell)
+
+    if total_chains <= 0 or total_units <= 0:
+        return 0.0
+
+    return M0_REPEAT * total_units / total_chains
+
+
+def perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng):
+    Nk_cell = Nk[j, i, :]
+
+    # Only insoluble chains are eligible for further scission.
+    # Soluble oligomers with k <= M_SOL are immediately transferred
+    # to the oligomer PDE field and must not be selected again.
+    available = np.where(Nk_cell > 0)[0]
+    available = available[available >= M_SOL + 1]
+
+    if available.size == 0:
+        return False
+
+    weights = Nk_cell[available].astype(float)
+    weights /= np.sum(weights)
+
+    k_old = int(rng.choice(available, p=weights))
+    r = int(rng.integers(1, k_old))
+
+    Nk[j, i, k_old] -= 1
+    Nk[j, i, r] += 1
+    Nk[j, i, k_old - r] += 1
+
+    Mn_field[j, i] = recalc_Mn_from_Nk_cell(Nk[j, i, :])
+    return True
+
+
+def move_m8_oligomers_to_PDE(
+    Nk,
+    Mn_field,
+    mass_field,
+    O_field,
+    j,
+    i,
+    N0_REPEAT,
+    m_sol=M_SOL
+):
+    m = int(max(1, min(m_sol, Nk.shape[2] - 1)))
+
+    small_counts = Nk[j, i, 1:m + 1].astype(float)
+
+    if np.sum(small_counts) <= 0:
+        return 0.0
+
+    k_vals = np.arange(1, m + 1, dtype=float)
+    soluble_units = float(np.sum(k_vals * small_counts))
+
+    if soluble_units <= 0.0:
+        return 0.0
+
+    soluble_fraction = soluble_units / float(N0_REPEAT)
+
+    mass_field[j, i] = max(0.0, mass_field[j, i] - soluble_fraction)
+    O_field[j, i] += soluble_fraction
+
+    Nk[j, i, 1:m + 1] = 0
+    Mn_field[j, i] = recalc_Mn_from_Nk_cell(Nk[j, i, :])
+
+    return soluble_fraction
+
+
+# ============================================================
+# 9) EROSION RULE
+# ============================================================
+def von_neumann_enzyme_sum(E_field):
+    Esum = np.zeros_like(E_field, dtype=float)
+
+    Esum[1:, :] += E_field[:-1, :]
+    Esum[:-1, :] += E_field[1:, :]
+    Esum[:, 1:] += E_field[:, :-1]
+    Esum[:, :-1] += E_field[:, 1:]
+
+    Esum[0, :] += E_BATH
+    Esum[-1, :] += E_BATH
+    Esum[:, 0] += E_BATH
+    Esum[:, -1] += E_BATH
+
+    return Esum
+
+
+def boundary_contact_mask(shape):
+    ny, nx = shape
+
+    mask = np.zeros((ny, nx), dtype=bool)
+
+    mask[0, :] = True
+    mask[-1, :] = True
+    mask[:, 0] = True
+    mask[:, -1] = True
+
+    return mask
+
+
+def update_voids_from_Mnc_and_von_neumann_enzyme(
+    phase,
+    Mn_field,
+    Nk,
+    deg_origin,
+    mass_field,
+    Mnc,
+    E_field,
+    k_det,
+    rng,
+    dt
+):
+    E_neigh_sum = von_neumann_enzyme_sum(E_field)
+    has_E_neigh = E_neigh_sum > ENZYME_NEIGHBOUR_THRESHOLD
+
+    boundary_contact = boundary_contact_mask(phase.shape)
+
+    eligible = (
+        (phase == S_DEG)
+        &
+        (
+            boundary_contact
+            | (Mn_field <= Mnc)
+        )
+        &
+        has_E_neigh
+    )
+
+    E_neigh_mean = E_neigh_sum / 4.0
+    P_void = 1.0 - np.exp(-k_det * E_neigh_mean * dt)
+    P_void = np.clip(P_void, 0.0, 1.0)
+
+    erode = eligible & (rng.random(phase.shape) < P_void)
+
+    phase[erode] = S_VOID
+    Mn_field[erode] = 0.0
+    mass_field[erode] = 0.0
+    Nk[erode, :] = 0
+    deg_origin[erode] = ORIGIN_NONE
+
+
+# ============================================================
+# 10) CA REACTION STEP
+# ============================================================
+def reaction_step(
+    phase,
+    bound,
+    E_field,
+    O_field,
+    Mn_field,
+    mass_field,
+    Nk,
+    deg_origin,
+    params,
+    rng,
+    dt,
+    N0_REPEAT
+):
+    k1, k3, k_conv, k_deg_C, k_deg_A, Mnc, k_det = params
+
+    ny, nx = phase.shape
+
+    phase_old = phase.copy()
+    bound_old = bound.copy()
+    E_old = E_field.copy()
+    origin_old = deg_origin.copy()
+
+    dE_quantum = E_BATH / max(ny * nx // 100, 1)
+
+    U1 = rng.random((ny, nx))
+    U2 = rng.random((ny, nx))
+
+    for j in range(ny):
+        for i in range(nx):
+            s = phase_old[j, i]
+            b = bound_old[j, i]
+            E_loc = E_old[j, i]
+
+            if s == S_VOID:
+                continue
+
+            u1 = U1[j, i]
+            u2 = U2[j, i]
+
+            if s == S_DEG:
+                origin = origin_old[j, i]
+
+                if origin == ORIGIN_C:
+                    rate = k_deg_C * E_loc
+                elif origin == ORIGIN_A:
+                    rate = k_deg_A * E_loc
+                else:
+                    rate = 0.0
+
+                P = 1.0 - np.exp(-rate * dt)
+
+                if u1 < P:
+                    perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng)
+
+                move_m8_oligomers_to_PDE(
+                    Nk,
+                    Mn_field,
+                    mass_field,
+                    O_field,
+                    j,
+                    i,
+                    N0_REPEAT
+                )
+
+                continue
+
+            if s == S_CRYST:
+                if not b:
+                    rate = k1 * E_loc
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P and E_loc > dE_quantum:
+                        bound[j, i] = True
+                        E_field[j, i] -= dE_quantum
+
+                else:
+                    rates = np.array([k_conv, k_deg_C], dtype=float)
+                    r_tot = np.sum(rates)
+
+                    if r_tot > 0:
+                        P = 1.0 - np.exp(-r_tot * dt)
+
+                        if u1 < P:
+                            cum = np.cumsum(rates) / r_tot
+
+                            if u2 < cum[0]:
+                                phase[j, i] = S_AMORPH
+                            else:
+                                phase[j, i] = S_DEG
+                                deg_origin[j, i] = ORIGIN_C
+
+                                perform_chain_scission_full_Nk(
+                                    Nk,
+                                    Mn_field,
+                                    j,
+                                    i,
+                                    rng
+                                )
+
+                                move_m8_oligomers_to_PDE(
+                                    Nk,
+                                    Mn_field,
+                                    mass_field,
+                                    O_field,
+                                    j,
+                                    i,
+                                    N0_REPEAT
+                                )
+
+                            bound[j, i] = False
+                            E_field[j, i] += dE_quantum
+
+                continue
+
+            if s == S_AMORPH:
+                if not b:
+                    rate = k3 * E_loc
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P and E_loc > dE_quantum:
+                        bound[j, i] = True
+                        E_field[j, i] -= dE_quantum
+
+                else:
+                    rate = k_deg_A
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P:
+                        phase[j, i] = S_DEG
+                        deg_origin[j, i] = ORIGIN_A
+
+                        perform_chain_scission_full_Nk(
+                            Nk,
+                            Mn_field,
+                            j,
+                            i,
+                            rng
+                        )
+
+                        move_m8_oligomers_to_PDE(
+                            Nk,
+                            Mn_field,
+                            mass_field,
+                            O_field,
+                            j,
+                            i,
+                            N0_REPEAT
+                        )
+
+                        bound[j, i] = False
+                        E_field[j, i] += dE_quantum
+
+                continue
+
+    update_voids_from_Mnc_and_von_neumann_enzyme(
+        phase=phase,
+        Mn_field=Mn_field,
+        Nk=Nk,
+        deg_origin=deg_origin,
+        mass_field=mass_field,
+        Mnc=Mnc,
+        E_field=E_field,
+        k_det=k_det,
+        rng=rng,
+        dt=dt
+    )
+
+    E_field[0, :] = E_BATH
+    E_field[-1, :] = E_BATH
+    E_field[:, 0] = E_BATH
+    E_field[:, -1] = E_BATH
+
+    O_field[0, :] = O_BATH
+    O_field[-1, :] = O_BATH
+    O_field[:, 0] = O_BATH
+    O_field[:, -1] = O_BATH
+
+    np.clip(E_field, 0.0, None, out=E_field)
+    np.clip(O_field, 0.0, None, out=O_field)
+
+
+# ============================================================
+# 11) SIMULATION DRIVER
+# ============================================================
+def unpack_theta(theta):
+    params_kinetic = tuple(theta[:7])
+
+    D_E_intact = float(theta[7])
+    D_E_void_ratio = float(theta[8])
+    D_O_poly = float(theta[9])
+    D_O_void_ratio = float(theta[10])
+
+    return (
+        params_kinetic,
+        D_E_intact,
+        D_E_void_ratio,
+        D_O_poly,
+        D_O_void_ratio
+    )
+
+
+def run_hybrid_one_geometry(theta, MW0, chi, t_end, seed, record_times):
+    rng = np.random.default_rng(seed)
+
+    (
+        params_kinetic,
+        D_E_intact,
+        D_E_void_ratio,
+        D_O_poly,
+        D_O_void_ratio
+    ) = unpack_theta(theta)
+
+    ny, nx = ROWS, COLS
+
+    N0_REPEAT = int(round(MW0 / M0_REPEAT))
+    M_MAX = N0_REPEAT
+
+    phase = rng.choice(
+        [S_AMORPH, S_CRYST],
+        size=(ny, nx),
+        p=[1.0 - chi, chi]
+    ).astype(int)
+
+    bound = np.zeros((ny, nx), dtype=bool)
+    deg_origin = np.full((ny, nx), ORIGIN_NONE, dtype=int)
+
+    Nk = np.zeros((ny, nx, M_MAX + 1), dtype=np.int16)
+    Nk[:, :, N0_REPEAT] = 1
+
+    Mn_field = MW0 * np.ones((ny, nx), dtype=float)
+    mass_field = np.ones((ny, nx), dtype=float)
+
+    O_field = np.zeros((ny, nx), dtype=float)
+
+    E_field = np.zeros((ny, nx), dtype=float)
+    E_field[0, :] = E_BATH
+    E_field[-1, :] = E_BATH
+    E_field[:, 0] = E_BATH
+    E_field[:, -1] = E_BATH
+
+    record_times = np.asarray(record_times, dtype=float)
+
+    t_record = []
+    wl_record = []
+    xc_record = []
+    porosity_record = []
+    mn_record = []
+
+    def metrics():
+        """
+        Mass-consistent observables for the geometry study.
+
+        mass_field is the remaining non-soluble polymer mass in each cell.
+        O_field is soluble oligomer mass still inside the film.
+        Oligomer that diffuses out through the zero-bath boundary is no longer
+        in O_field and therefore contributes to weight loss.
+
+        Weight loss:
+            WL = 1 - total_remaining_mass / initial_total_mass
+
+        Crystallinity:
+            Xc = crystalline polymer mass / total remaining material mass
+
+        This matches the corrected polymer-mass logic used for the one-polymer
+        PCL scripts and avoids cell-count crystallinity.
+        """
+
+        N_total = ny * nx
+
+        massC = np.sum(mass_field[phase == S_CRYST])
+        massA = np.sum(mass_field[phase == S_AMORPH])
+        massD = np.sum(mass_field[phase == S_DEG])
+        massO_inside = np.sum(O_field)
+
+        total_remaining_mass = massC + massA + massD + massO_inside
+
+        wl = 1.0 - total_remaining_mass / float(N_total)
+        wl = float(np.clip(wl, 0.0, 1.0))
+
+        xc = massC / total_remaining_mass if total_remaining_mass > 0 else 0.0
+
+        porosity = np.count_nonzero(phase == S_VOID) / float(N_total)
+
+        mn_global = recalc_Mn_from_Nk_cell(np.sum(Nk, axis=(0, 1)))
+
+        return wl, xc, porosity, mn_global
+
+    t = 0.0
+
+    wl0, xc0, por0, mn0 = metrics()
+
+    t_record.append(0.0)
+    wl_record.append(wl0)
+    xc_record.append(xc0)
+    porosity_record.append(por0)
+    mn_record.append(mn0)
+
+    next_record_idx = 1
+
+    while t < t_end - 1e-12:
+        E_field = diffuse_E(
+            E_field,
+            phase,
+            D_E_intact,
+            D_E_void_ratio,
+            DT,
+            DX
+        )
+
+        O_field = diffuse_oligomer(
+            O_field,
+            phase,
+            D_O_poly,
+            D_O_void_ratio,
+            DT,
+            DX
+        )
+
+        reaction_step(
+            phase=phase,
+            bound=bound,
+            E_field=E_field,
+            O_field=O_field,
+            Mn_field=Mn_field,
+            mass_field=mass_field,
+            Nk=Nk,
+            deg_origin=deg_origin,
+            params=params_kinetic,
+            rng=rng,
+            dt=DT,
+            N0_REPEAT=N0_REPEAT
+        )
+
+        t += DT
+
+        while (
+            next_record_idx < len(record_times)
+            and record_times[next_record_idx] <= t + 1e-12
+        ):
+            wl, xc, porosity, mn_global = metrics()
+
+            t_record.append(record_times[next_record_idx])
+            wl_record.append(wl)
+            xc_record.append(xc)
+            porosity_record.append(porosity)
+            mn_record.append(mn_global)
+
+            next_record_idx += 1
+
+    return {
+        "time": np.array(t_record),
+        "wl": np.array(wl_record),
+        "xc": np.array(xc_record),
+        "porosity": np.array(porosity_record),
+        "mn": np.array(mn_record),
+    }
+
+
+def simulate_geometry_case(theta, geometry, record_times):
+    set_geometry_grid(
+        length_mm=geometry["length_mm"],
+        thickness_mm=geometry["thickness_mm"]
+    )
+
+    wl_runs = []
+    xc_runs = []
+    porosity_runs = []
+    mn_runs = []
+
+    for sd in SEEDS:
+        out = run_hybrid_one_geometry(
+            theta=theta,
+            MW0=MN0,
+            chi=X_FIXED,
+            t_end=float(np.max(record_times)),
+            seed=int(sd),
+            record_times=record_times
+        )
+
+        wl_runs.append(out["wl"])
+        xc_runs.append(out["xc"])
+        porosity_runs.append(out["porosity"])
+        mn_runs.append(out["mn"])
+
+    wl_runs = np.asarray(wl_runs)
+    xc_runs = np.asarray(xc_runs)
+    porosity_runs = np.asarray(porosity_runs)
+    mn_runs = np.asarray(mn_runs)
+
+    return {
+        "name": geometry["name"],
+        "type": geometry["type"],
+        "length_mm": geometry["length_mm"],
+        "thickness_mm": geometry["thickness_mm"],
+        "rows": ROWS,
+        "cols": COLS,
+        "dx": DX,
+        "time": record_times,
+        "wl_mean": np.mean(wl_runs, axis=0),
+        "wl_sd": np.std(wl_runs, axis=0),
+        "xc_mean": np.mean(xc_runs, axis=0),
+        "xc_sd": np.std(xc_runs, axis=0),
+        "porosity_mean": np.mean(porosity_runs, axis=0),
+        "porosity_sd": np.std(porosity_runs, axis=0),
+        "mn_mean": np.mean(mn_runs, axis=0),
+        "mn_sd": np.std(mn_runs, axis=0),
+    }
+
+
+# ============================================================
+# 12) SUMMARY METRIC
+# ============================================================
+def time_to_threshold(time, y, threshold):
+    time = np.asarray(time, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if np.all(y < threshold):
+        return np.nan
+
+    idx = np.where(y >= threshold)[0][0]
+
+    if idx == 0:
+        return time[0]
+
+    t0, t1 = time[idx - 1], time[idx]
+    y0, y1 = y[idx - 1], y[idx]
+
+    if y1 == y0:
+        return t1
+
+    return t0 + (threshold - y0) * (t1 - t0) / (y1 - y0)
+
+
+# ============================================================
+# 13) MAIN
+# ============================================================
+if __name__ == "__main__":
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("\n================ GEOMETRY STUDY ================")
+    print("No calibration is performed.")
+    print("The PCL6800 calibrated parameters are fixed.")
+    print(f"TARGET_ROWS = {TARGET_ROWS}")
+    print(f"Number of stochastic repeats per geometry = {N_REP}")
+
+    record_times = np.linspace(0, T_END, 101)
+
+    all_results = []
+
+    for geom in GEOMETRY_CASES:
+        print("\n------------------------------------------------")
+        print(f"Running geometry: {geom['name']}")
+        print(f"Length = {geom['length_mm']} mm")
+        print(f"Thickness = {geom['thickness_mm']} mm")
+
+        result = simulate_geometry_case(
+            theta=THETA_FIXED,
+            geometry=geom,
+            record_times=record_times
+        )
+
+        print(f"Grid used: {result['rows']} x {result['cols']}")
+        print(f"Final WL = {100.0 * result['wl_mean'][-1]:.2f}%")
+        print(f"Final Xc = {100.0 * result['xc_mean'][-1]:.2f}%")
+
+        all_results.append(result)
+
+    # ========================================================
+    # SAVE EXCEL RESULTS
+    # ========================================================
+    excel_path = os.path.join(
+        OUTPUT_DIR,
+        f"PCL6800_thickness_geometry_study_fixed_params_{timestamp}.xlsx"
+    )
+
+    summary_rows = []
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        for res in all_results:
+            df = pd.DataFrame({
+                "time_h": res["time"],
+                "WL_mean_percent": 100.0 * res["wl_mean"],
+                "WL_sd_percent": 100.0 * res["wl_sd"],
+                "Xc_mean_percent": 100.0 * res["xc_mean"],
+                "Xc_sd_percent": 100.0 * res["xc_sd"],
+                "Porosity_mean_percent": 100.0 * res["porosity_mean"],
+                "Porosity_sd_percent": 100.0 * res["porosity_sd"],
+                "Mn_mean_g_per_mol": res["mn_mean"],
+                "Mn_sd_g_per_mol": res["mn_sd"],
+            })
+
+            df.to_excel(writer, sheet_name=res["name"][:31], index=False)
+
+            t50 = time_to_threshold(res["time"], res["wl_mean"], 0.50)
+
+            summary_rows.append({
+                "Geometry": res["name"],
+                "Length_mm": res["length_mm"],
+                "Thickness_mm": res["thickness_mm"],
+                "Rows": res["rows"],
+                "Cols": res["cols"],
+                "DX": res["dx"],
+                "Final_WL_percent": 100.0 * res["wl_mean"][-1],
+                "Final_Xc_percent": 100.0 * res["xc_mean"][-1],
+                "Final_Porosity_percent": 100.0 * res["porosity_mean"][-1],
+                "Final_Mn_g_per_mol": res["mn_mean"][-1],
+                "Time_to_50_percent_WL_h": t50,
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
+    # ========================================================
+    # PLOT 1: WEIGHT LOSS — THICKNESS GEOMETRIES
+    # ========================================================
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    for res in all_results:
+        ax.plot(
+            res["time"],
+            100.0 * res["wl_mean"],
+            lw=3,
+            label=f"{res['thickness_mm']} mm ({res['rows']}x{res['cols']})"
+        )
+
+    ax.set_xlabel("Time (h)", fontsize=18)
+    ax.set_ylabel("Weight loss (%)", fontsize=18)
+    ax.tick_params(axis="both", labelsize=15)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=10, frameon=True)
+
+    plt.tight_layout()
+
+    wl_fig_path = os.path.join(
+        OUTPUT_DIR,
+        f"PCL6800_thickness_weight_loss_fixed_params_{timestamp}.png"
+    )
+
+    plt.savefig(wl_fig_path, dpi=600, bbox_inches="tight")
+    plt.show()
+
+    # ========================================================
+    # PLOT 2: CRYSTALLINITY — THICKNESS GEOMETRIES
+    # ========================================================
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    for res in all_results:
+        ax.plot(
+            res["time"],
+            100.0 * res["xc_mean"],
+            lw=3,
+            label=f"{res['thickness_mm']} mm ({res['rows']}x{res['cols']})"
+        )
+
+    ax.set_xlabel("Time (h)", fontsize=18)
+    ax.set_ylabel("Remaining crystallinity (%)", fontsize=18)
+    ax.tick_params(axis="both", labelsize=15)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=10, frameon=True)
+
+    plt.tight_layout()
+
+    xc_fig_path = os.path.join(
+        OUTPUT_DIR,
+        f"PCL6800_thickness_crystallinity_fixed_params_{timestamp}.png"
+    )
+
+    plt.savefig(xc_fig_path, dpi=600, bbox_inches="tight")
+    plt.show()
+
+    # ========================================================
+    # SAVE SUMMARY TABLE
+    # ========================================================
+    summary_path = os.path.join(
+        OUTPUT_DIR,
+        f"PCL6800_thickness_geometry_summary_fixed_params_{timestamp}.tsv"
+    )
+
+    summary_df.to_csv(summary_path, sep="\t", index=False)
+
+    print("\n================ SAVED FILES ================")
+    print(f"Excel results: {excel_path}")
+    print(f"Summary table: {summary_path}")
+    print(f"Weight loss plot: {wl_fig_path}")
+    print(f"Crystallinity plot: {xc_fig_path}")
+
+    print("\nDone.")
