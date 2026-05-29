@@ -255,7 +255,7 @@ end
 
 % =====================================================================
 function [Nk,Mn]=scission(Nk,Mn,j,i,C)
-cell=squeeze(Nk(j,i,:))'; idxs=find(cell>0); ks=idxs-1; keep=ks>=2; idxs=idxs(keep); ks=ks(keep);
+cell=squeeze(Nk(j,i,:))'; idxs=find(cell>0); ks=idxs-1; keep=ks >= C.M_SOL + 1; idxs=idxs(keep); ks=ks(keep);
 if isempty(ks), return; end
 w=cell(idxs); w=w/sum(w); pick=weighted_choice(w); kold=ks(pick); oldidx=kold+1; r=randi([1,kold-1]); k2=kold-r;
 Nk(j,i,oldidx)=Nk(j,i,oldidx)-1; Nk(j,i,r+1)=Nk(j,i,r+1)+1; Nk(j,i,k2+1)=Nk(j,i,k2+1)+1;
