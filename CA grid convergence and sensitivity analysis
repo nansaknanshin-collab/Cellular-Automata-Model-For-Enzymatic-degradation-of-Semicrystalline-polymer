@@ -1,5 +1,5 @@
 # ============================================================
-# HYBRID CA/PDE GRID SENSITIVITY AND CONVERGENCE
+#CA GRID SENSITIVITY AND CONVERGENCE
 # Fixed PCL6500 parameters, no calibration, no data points
 # ============================================================
 
@@ -256,7 +256,7 @@ def perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng):
     Nk_cell = Nk[j, i, :]
 
     available = np.where(Nk_cell > 0)[0]
-    available = available[available >= 2]
+    available = available[available >= M_SOL + 1]
 
     if available.size == 0:
         return False
