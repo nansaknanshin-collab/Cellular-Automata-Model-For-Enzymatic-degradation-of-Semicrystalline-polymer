@@ -1,0 +1,877 @@
+function PCL6800_CA_PDE_VanMourik_DEMCz_FAITHFUL_MATLAB()
+
+rng(42);
+
+% -------------------- OUTPUT --------------------
+if ispc
+    downloadsDir = fullfile(getenv('USERPROFILE'),'Downloads');
+else
+    downloadsDir = fullfile(getenv('HOME'),'Downloads');
+end
+OUTPUT_DIR = fullfile(downloadsDir, 'PCL6800_CA_PDE_VanMourik_DEMCz_FAITHFUL_MATLAB');
+if ~exist(OUTPUT_DIR,'dir'); mkdir(OUTPUT_DIR); end
+timestamp = datestr(now,'yyyymmdd_HHMMSS');
+fprintf('Results will be saved in:\n%s\n', OUTPUT_DIR);
+
+% -------------------- PLOT SETTINGS --------------------
+FS = 18;
+EXPORT_DPI = 600;
+
+% -------------------- DATA: PCL6800 --------------------
+data.SELECTED_POLYMER = 'PCL6800';
+data.MN0 = 40931.18;
+data.X_FIXED = 0.60;
+data.t_xc = [0 1 2 4 6 8 12 16 20]';
+data.xc_obs = [60, 58, 56, 52, 36, 5, 3.5, 3, 2]' / 100.0;
+data.t_wl = [0 1 2 4 6 8 12 16 20]';
+data.wl_obs = [0, 11, 23, 43, 61, 70, 83, 84, 85]' / 100.0;
+
+t_fit = unique([data.t_wl; data.t_xc]);
+T_END = max(t_fit);
+
+% -------------------- LIKELIHOOD NOISE MODEL --------------------
+
+SIGMA_WL = 0.03;
+SIGMA_XC = 0.03;
+
+% -------------------- GRID / CONSTANTS --------------------
+C.BASE_ROWS = 10;
+C.BASE_COLS = 333;
+C.BASE_DX   = 1.0;
+C.L_Y = C.BASE_ROWS * C.BASE_DX;
+C.L_X = C.BASE_COLS * C.BASE_DX;
+C.TARGET_ROWS = 10;
+C.DX = C.L_Y / C.TARGET_ROWS;
+C.ROWS = C.TARGET_ROWS;
+C.COLS = round(C.L_X / C.DX);
+C.DT = 0.05;
+
+C.S_CRYST = 1;
+C.S_AMORPH = 0;
+C.S_DEG = 2;
+C.S_VOID = -1;
+C.ORIGIN_NONE = 0;
+C.ORIGIN_C = 1;
+C.ORIGIN_A = 2;
+C.E_BATH = 1.0;
+C.O_BATH = 0.0;
+C.PHI_WINDOW = 1;
+C.M_SOL = 8;
+C.M0_REPEAT = 114.14;
+C.SEED = 42;
+
+% Seed used for every forward CA call inside the chain. Fixing this
+% makes the likelihood a deterministic function of theta, which is what
+% MCMC requires. Stochastic CA noise is absorbed into SIGMA_WL/SIGMA_XC.
+C.FIXED_LIK_SEED = 42;
+
+C.ENZYME_NEIGHBOUR_THRESHOLD = 1e-12;
+
+fprintf('\n================ GRID ================\n');
+fprintf('Grid: %d x %d, DX = %.6g, DT = %.6g\n', C.ROWS, C.COLS, C.DX, C.DT);
+fprintf('Physical size: %.4f x %.4f\n', C.ROWS*C.DX, C.COLS*C.DX);
+fprintf('M_SOL = %d repeat units\n', C.M_SOL);
+fprintf('Fixed likelihood seed: %d\n', C.FIXED_LIK_SEED);
+fprintf('SIGMA_WL = %.4g, SIGMA_XC = %.4g\n', SIGMA_WL, SIGMA_XC);
+
+% -------------------- PARAMETER VECTOR --------------------
+paramNames = {'k1','k3','k_conv','k_deg_C','k_deg_A','Mnc','k_det', ...
+              'D_E_intact','D_E_void_ratio','D_O_poly','D_O_void_ratio'};
+paramLabels = {'$k_1$','$k_3$','$k_{conv}$','$k_{deg,C}$','$k_{deg,A}$', ...
+               '$M_{nc}$','$k_{det}$','$D_{E,intact}$','$R_D^E$', ...
+               '$D_{O,poly}$','$R_D^O$'};
+
+% PSO+SLSQP MAP from PCL6800 calibration (user-supplied).
+pml = [ ...
+    7.044556e-01, ...   % k1
+    5.452806e+00, ...   % k3
+    2.166817e-01, ...   % k_conv
+    2.036970e-01, ...   % k_deg_C
+    2.714791e+00, ...   % k_deg_A
+    9.035547e+03, ...   % Mnc
+    3.090817e+00, ...   % k_det
+    3.613257e+01, ...   % D_E_intact
+    2.128633e+00, ...   % D_E_void_ratio
+    3.181385e+01, ...   % D_O_poly
+    4.519929e+01 ...    % D_O_void_ratio
+];
+lo = [1e-6, 1e-6, 1e-8, 1e-6, 1e-6, 1e-6, 1e-6, 1e-4, 1.0, 1e-6, 1.0];
+hi = [2.0,  8.0,  1.0,  1.0,  3.0,  25000.0, 5.0, 50.0, 5.0, 50.0, 100.0];
+
+% Ensure pml is inside the admissible bounds.
+pml = min(max(pml, lo), hi);
+
+fprintf('\n================ MODEL SUMMARY ================\n');
+fprintf('One-polymer fit: %s\n', data.SELECTED_POLYMER);
+fprintf('Likelihood: Gaussian on WL + Xc, sigma WL = %.3g, sigma Xc = %.3g\n', SIGMA_WL, SIGMA_XC);
+fprintf('Boundary-contact erosion rule retained exactly.\n');
+fprintf('Parameter dimension: %d\n', numel(pml));
+
+% -------------------- DE-MCz SETTINGS --------------------
+MCMC.NIT = 800;          % bump higher for production (e.g. 2000+)
+MCMC.NTHIN = 5;
+MCMC.NCHAIN = 5;
+MCMC.N_WALKERS = MCMC.NCHAIN * 8;
+MCMC.JITTER = 1e-5 * ones(1,numel(pml));
+MCMC.GAMMA = [];
+MCMC.INIT_SPREAD = 0.10;
+MCMC.BURN_FRAC = 0.30;   % discard first 30% of saved states
+
+fprintf('\n================ DE-MCz SETTINGS ================\n');
+fprintf('NIT = %d, NTHIN = %d, walkers = %d, burn-in = %.0f%%\n', ...
+    MCMC.NIT, MCMC.NTHIN, MCMC.N_WALKERS, 100*MCMC.BURN_FRAC);
+
+% -------------------- RUN POSTERIOR SAMPLING --------------------
+[samples_log, logprob] = run_DEMCz_CA(data, C, pml, lo, hi, MCMC, SIGMA_WL, SIGMA_XC);
+if isempty(samples_log)
+    error('No posterior samples saved. Check pml, bounds, or likelihood.');
+end
+
+samples = exp(samples_log);
+valid = all(isfinite(samples),2) & isfinite(logprob(:));
+samples = samples(valid,:);
+logprob = logprob(valid);
+if isempty(samples)
+    error('All posterior samples are non-finite.');
+end
+
+% Burn-in discard (drop the first BURN_FRAC of saved states).
+nDrop = floor(MCMC.BURN_FRAC * size(samples,1));
+if nDrop > 0 && nDrop < size(samples,1)
+    samples = samples((nDrop+1):end, :);
+    logprob = logprob((nDrop+1):end);
+end
+fprintf('Posterior samples after burn-in: %d\n', size(samples,1));
+
+best_params = mean(samples,1);
+
+fprintf('\n================ POSTERIOR MEAN PARAMETERS ================\n');
+for i = 1:numel(best_params)
+    if strcmp(paramNames{i},'Mnc')
+        fprintf('%-18s = %.8g g/mol\n', paramNames{i}, best_params(i));
+    else
+        fprintf('%-18s = %.8g\n', paramNames{i}, best_params(i));
+    end
+end
+
+% Save posterior samples.
+sampleTable = array2table(samples, 'VariableNames', matlab.lang.makeValidName(paramNames));
+samplePath = fullfile(OUTPUT_DIR, ['posterior_samples_' timestamp '.csv']);
+writetable(sampleTable, samplePath);
+fprintf('Saved posterior samples: %s\n', samplePath);
+
+% -------------------- PARAMETER UNCERTAINTY PLOTS --------------------
+plot_parameter_CI(samples, paramLabels, FS);
+save_fig(fullfile(OUTPUT_DIR, ['parameter_CI_' timestamp '.png']), EXPORT_DPI);
+
+plot_pairwise(samples, best_params, paramLabels, FS);
+save_fig(fullfile(OUTPUT_DIR, ['pairwise_posterior_' timestamp '.png']), EXPORT_DPI);
+
+% -------------------- POSTERIOR PREDICTION UNCERTAINTY --------------------
+tgrid = linspace(0, T_END, 300)';
+maxPredSamples = min(150, size(samples,1));
+idxPred = round(linspace(1, size(samples,1), maxPredSamples));
+predSamples = samples(idxPred,:);
+
+% Use FIXED seed for every forward run so the band shows parameter
+% uncertainty, not CA noise.
+[predWL, predXC] = compute_predictions_CA(predSamples, data, C, tgrid);
+
+ciWL_low  = prctile(predWL,  2.5, 1);
+ciWL_high = prctile(predWL, 97.5, 1);
+ciXC_low  = prctile(predXC,  2.5, 1);
+ciXC_high = prctile(predXC, 97.5, 1);
+meanWL = mean(predWL, 1);
+meanXC = mean(predXC, 1);
+
+% Q95 with shared seed between best and sample so the log2 ratio is
+% driven by parameters, not RNG noise.
+Q95_WL = compute_Q95_CA_WL(predSamples, best_params, data, C, data.t_wl);
+Q95_XC = compute_Q95_CA_XC(predSamples, best_params, data, C, data.t_xc);
+fprintf('\nQ_0.95 (WL) = %.8g\n', Q95_WL);
+fprintf('Q_0.95 (Xc) = %.8g\n', Q95_XC);
+
+% Save prediction data.
+predTable = table(tgrid, meanWL(:), ciWL_low(:), ciWL_high(:), meanXC(:), ciXC_low(:), ciXC_high(:), ...
+    'VariableNames', {'time_h','WL_mean_fraction','WL_low_fraction','WL_high_fraction','Xc_mean_fraction','Xc_low_fraction','Xc_high_fraction'});
+predPath = fullfile(OUTPUT_DIR, ['prediction_uncertainty_curves_' timestamp '.csv']);
+writetable(predTable, predPath);
+
+% WL plot.
+figure('Color','w','Position',[100 100 900 650]); hold on; box on; grid on;
+fill([tgrid' fliplr(tgrid')], [ciWL_low fliplr(ciWL_high)], [0 0.7 0], ...
+     'EdgeColor','none','FaceAlpha',0.35,'DisplayName','Prediction uncertainty');
+plot(tgrid, meanWL, 'r-', 'LineWidth', 4, 'DisplayName', 'Posterior mean prediction');
+plot(data.t_wl, data.wl_obs, 'ko', 'MarkerSize', 9, 'MarkerFaceColor','k', 'DisplayName','PCL6800-CALB data');
+xlabel('Time (h)','FontSize',FS);
+ylabel('Weight loss (fraction)','FontSize',FS);
+set(gca,'FontSize',FS);
+legend('Location','southeast','FontSize',FS-3,'Box','off');
+save_fig(fullfile(OUTPUT_DIR, ['WL_prediction_uncertainty_' timestamp '.png']), EXPORT_DPI);
+
+% Xc plot.
+figure('Color','w','Position',[100 100 900 650]); hold on; box on; grid on;
+fill([tgrid' fliplr(tgrid')], [ciXC_low fliplr(ciXC_high)], [0 0.7 0], ...
+     'EdgeColor','none','FaceAlpha',0.35,'DisplayName','Prediction uncertainty');
+plot(tgrid, meanXC, 'r-', 'LineWidth', 4, 'DisplayName', 'Posterior mean prediction');
+plot(data.t_xc, data.xc_obs, 'ks', 'MarkerSize', 9, 'MarkerFaceColor','k', 'DisplayName','PCL6800-CALB data');
+xlabel('Time (h)','FontSize',FS);
+ylabel('Remaining crystallinity (fraction)','FontSize',FS);
+set(gca,'FontSize',FS);
+legend('Location','northeast','FontSize',FS-3,'Box','off');
+save_fig(fullfile(OUTPUT_DIR, ['Xc_prediction_uncertainty_' timestamp '.png']), EXPORT_DPI);
+
+% Save summary.
+summaryPath = fullfile(OUTPUT_DIR, ['summary_' timestamp '.txt']);
+fid = fopen(summaryPath,'w');
+fprintf(fid, 'Selected polymer\t%s\n', data.SELECTED_POLYMER);
+fprintf(fid, 'ROWS\t%d\nCOLS\t%d\nDX\t%.12g\nDT\t%.12g\n', C.ROWS, C.COLS, C.DX, C.DT);
+fprintf(fid, 'SIGMA_WL\t%.12g\nSIGMA_XC\t%.12g\n', SIGMA_WL, SIGMA_XC);
+fprintf(fid, 'FIXED_LIK_SEED\t%d\n', C.FIXED_LIK_SEED);
+fprintf(fid, 'Boundary erosion rule\tboundary S_DEG immediately eligible probabilistically; interior requires Mn <= Mnc and von Neumann enzyme\n');
+fprintf(fid, 'Q95_WL\t%.12g\nQ95_Xc\t%.12g\n', Q95_WL, Q95_XC);
+fprintf(fid, 'Posterior samples (after burn-in)\t%d\n', size(samples,1));
+fprintf(fid, 'NIT\t%d\nNTHIN\t%d\nN_WALKERS\t%d\nBURN_FRAC\t%.4g\n', ...
+    MCMC.NIT, MCMC.NTHIN, MCMC.N_WALKERS, MCMC.BURN_FRAC);
+fprintf(fid, '\nPosterior mean parameters\n');
+for i = 1:numel(best_params)
+    fprintf(fid, '%s\t%.12g\n', paramNames{i}, best_params(i));
+end
+fprintf(fid, '\nPosterior 95%% credible intervals\n');
+lo95 = prctile(samples, 2.5, 1);
+hi95 = prctile(samples, 97.5, 1);
+for i = 1:numel(best_params)
+    fprintf(fid, '%s\t[%.6g, %.6g]\n', paramNames{i}, lo95(i), hi95(i));
+end
+fclose(fid);
+fprintf('Saved summary: %s\n', summaryPath);
+fprintf('\nDone.\n');
+end
+
+% ============================================================
+% DE-MCz WRAPPER
+% ============================================================
+function [savedStates, savedLogprob] = run_DEMCz_CA(data, C, pml, lo, hi, MCMC, sigmaWL, sigmaXC)
+lb = log(lo);
+ub = log(hi);
+d = numel(pml);
+logpost = @(thetaLog) logposterior_CA(thetaLog, lb, ub, data, C, sigmaWL, sigmaXC);
+
+initPos = nan(MCMC.N_WALKERS, d);
+for w = 1:MCMC.N_WALKERS
+    ok = false;
+    for tries = 1:300
+        cand = log(pml) + MCMC.INIT_SPREAD * randn(1,d);
+        cand = min(max(cand, lb), ub);
+        if isfinite(logpost(cand))
+            initPos(w,:) = cand;
+            ok = true;
+            break;
+        end
+    end
+    if ~ok
+        cand = min(max(log(pml), lb), ub);
+        initPos(w,:) = cand;
+    end
+end
+
+Z = initPos;
+currentLogprob = [];
+[savedStates, savedLogprob] = DEMCz(logpost, initPos, Z, MCMC.NIT, MCMC.NTHIN, {1:d}, currentLogprob, [], MCMC.GAMMA, MCMC.JITTER);
+
+mask = isfinite(savedLogprob) & all(savedStates >= lb,2) & all(savedStates <= ub,2);
+savedStates = savedStates(mask,:);
+savedLogprob = savedLogprob(mask);
+end
+
+function logp = logposterior_CA(thetaLog, lb, ub, data, C, sigmaWL, sigmaXC)
+if any(thetaLog < lb) || any(thetaLog > ub)
+    logp = -inf;
+    return;
+end
+
+theta = exp(thetaLog);
+if ~is_valid_theta(theta)
+    logp = -inf;
+    return;
+end
+
+try
+    % Single deterministic forward run using the fixed likelihood seed.
+    % This makes logposterior a function of theta only.
+    pred = simulate_polymer_predictions(data, C, theta, C.FIXED_LIK_SEED, unique([data.t_wl; data.t_xc]));
+
+    rWL = (pred.wl(:) - data.wl_obs(:)) / sigmaWL;
+    rXC = (pred.xc(:) - data.xc_obs(:)) / sigmaXC;
+
+    % Gaussian log-likelihood with explicit sigma (constants kept for
+    % completeness; they do not affect posterior shape because sigma
+    % is fixed, but they keep numbers consistent if sigma is changed).
+    logp = -0.5 * (sum(rWL.^2) + sum(rXC.^2)) ...
+           - numel(rWL) * log(sigmaWL) ...
+           - numel(rXC) * log(sigmaXC);
+
+    if ~isfinite(logp); logp = -inf; end
+catch
+    logp = -inf;
+end
+end
+
+function tf = is_valid_theta(theta)
+tf = all(theta > 0);
+if ~tf; return; end
+k1 = theta(1); k3 = theta(2); kdegC = theta(4); kdegA = theta(5);
+Mnc = theta(6); DEratio = theta(9); DOratio = theta(11);
+if kdegA <= kdegC; tf = false; return; end
+if k3 <= k1; tf = false; return; end
+if ~(0.0 <= Mnc && Mnc <= 25000.0); tf = false; return; end
+if ~(1.0 <= DEratio && DEratio <= 100.0); tf = false; return; end
+if ~(1.0 <= DOratio && DOratio <= 100.0); tf = false; return; end
+end
+
+% ============================================================
+% SAME MODEL FUNCTIONS AS THE CA/PDE CODE
+% ============================================================
+function pred = simulate_polymer_predictions(data, C, theta, seed, recordTimes)
+% seed is passed in explicitly so the caller controls determinism.
+if nargin < 5 || isempty(recordTimes)
+    recordTimes = unique([data.t_wl; data.t_xc]);
+end
+params = unpack_theta(theta);
+tEnd = max(recordTimes);
+
+[tSim, wlSim, xcSim, ~, ~] = run_hybrid_one_polymer(params, data.MN0, data.X_FIXED, tEnd, seed, recordTimes, C);
+pred.wl = interp1(tSim, wlSim, data.t_wl, 'linear', 'extrap');
+pred.xc = interp1(tSim, xcSim, data.t_xc, 'linear', 'extrap');
+end
+
+function params = unpack_theta(theta)
+params.kinetic = theta(1:7);
+params.D_E_intact = theta(8);
+params.D_E_void_ratio = theta(9);
+params.D_O_poly = theta(10);
+params.D_O_void_ratio = theta(11);
+end
+
+function [t_record, wl_record, xc_record, mn_record, olig_record] = run_hybrid_one_polymer(params, MW0, chi, tEnd, seed, recordTimes, C)
+rng(seed);
+ny = C.ROWS; nx = C.COLS;
+N0_REPEAT = round(MW0 / C.M0_REPEAT);
+M_MAX = N0_REPEAT;
+
+phase = zeros(ny,nx,'int16');
+U = rand(ny,nx);
+phase(U < chi) = C.S_CRYST;
+phase(U >= chi) = C.S_AMORPH;
+
+bound = false(ny,nx);
+deg_origin = C.ORIGIN_NONE * ones(ny,nx,'int16');
+Nk = zeros(ny,nx,M_MAX+1,'int16');
+Nk(:,:,N0_REPEAT+1) = int16(1);
+Mn_field = MW0 * ones(ny,nx);
+mass_field = ones(ny,nx);
+O_field = zeros(ny,nx);
+E_field = zeros(ny,nx);
+E_field(1,:) = C.E_BATH; E_field(end,:) = C.E_BATH; E_field(:,1) = C.E_BATH; E_field(:,end) = C.E_BATH;
+
+recordTimes = recordTimes(:);
+t_record = [];
+wl_record = [];
+xc_record = [];
+mn_record = [];
+olig_record = [];
+
+[wl0, xc0, mn0, olig0] = metrics_CA(phase, mass_field, O_field, Nk, C);
+t_record(end+1,1)=0; wl_record(end+1,1)=wl0; xc_record(end+1,1)=xc0; mn_record(end+1,1)=mn0; olig_record(end+1,1)=olig0;
+
+nextIdx = 2;
+t = 0.0;
+while t < tEnd - 1e-12
+    E_field = diffuse_E(E_field, phase, params.D_E_intact, params.D_E_void_ratio, C.DT, C.DX, C);
+    O_field = diffuse_oligomer(O_field, phase, params.D_O_poly, params.D_O_void_ratio, C.DT, C.DX, C);
+    [phase, bound, E_field, O_field, Mn_field, mass_field, Nk, deg_origin] = reaction_step(phase, bound, E_field, O_field, Mn_field, mass_field, Nk, deg_origin, params.kinetic, C.DT, N0_REPEAT, C);
+    t = t + C.DT;
+    while nextIdx <= numel(recordTimes) && recordTimes(nextIdx) <= t + 1e-12
+        [wl, xc, mn, olig] = metrics_CA(phase, mass_field, O_field, Nk, C);
+        t_record(end+1,1) = recordTimes(nextIdx);
+        wl_record(end+1,1) = wl;
+        xc_record(end+1,1) = xc;
+        mn_record(end+1,1) = mn;
+        olig_record(end+1,1) = olig;
+        nextIdx = nextIdx + 1;
+    end
+end
+end
+
+function [wl, xc, mn_global, olig_inside] = metrics_CA(phase, mass_field, O_field, Nk, C)
+% Mass-based observables matching the manuscript (Model Outputs section):
+%   WL  = 1 - (sum(mass) + sum(O))/N_total
+%   X_c = M_C / (M_C + M_A + M_D + M_G)
+% with M_phase = sum of remaining insoluble mass in cells of that phase
+% and M_G = sum of soluble oligomers still inside the film. Void cells
+% carry mass = 0 and are excluded from the denominator.
+ny = size(phase,1); nx = size(phase,2);
+N_total = ny * nx;
+
+M_C = sum(mass_field(phase == C.S_CRYST), 'all');
+M_A = sum(mass_field(phase == C.S_AMORPH), 'all');
+M_D = sum(mass_field(phase == C.S_DEG), 'all');
+M_G = sum(O_field, 'all');
+
+total_remaining_mass = M_C + M_A + M_D + M_G;
+wl = 1.0 - total_remaining_mass / double(N_total);
+wl = min(max(wl,0.0),1.0);
+
+denom_mass = M_C + M_A + M_D + M_G;
+if denom_mass > 0
+    xc = M_C / denom_mass;
+else
+    xc = 0.0;
+end
+
+NkSum = squeeze(sum(sum(double(Nk),1),2));
+mn_global = recalc_Mn_from_Nk_cell(NkSum, C);
+olig_inside = M_G / double(N_total);
+end
+
+function phi = compute_porosity_field(phase, window, C)
+void_only = double(phase == C.S_VOID);
+[ny,nx] = size(phase);
+phi = zeros(ny,nx);
+pad = max(round(window),1);
+padded = ones(ny+2*pad, nx+2*pad);
+padded((pad+1):(pad+ny), (pad+1):(pad+nx)) = void_only;
+w = 2*pad + 1;
+for dj = -pad:pad
+    for di = -pad:pad
+        phi = phi + padded((pad+1+dj):(pad+ny+dj), (pad+1+di):(pad+nx+di));
+    end
+end
+phi = phi / double(w*w);
+end
+
+function D = effective_diffusivity(phi, D_intact, D_void_ratio)
+D = D_intact .* (1.0 + (D_void_ratio - 1.0).*phi);
+end
+
+function [A, rhs_extra] = build_diffusion_matrix(D_field, dt, dx, bath_value)
+[ny,nx] = size(D_field);
+nr = ny - 2; nc = nx - 2;
+if nr <= 0 || nc <= 0; error('ROWS and COLS must both be at least 3.'); end
+N = nr * nc;
+rows = zeros(N*5,1); cols = zeros(N*5,1); vals = zeros(N*5,1); ptr = 0;
+rhs_extra = zeros(N,1);
+idx = @(j,i) (j-2)*nc + (i-1);
+for j = 2:(ny-1)
+    for i = 2:(nx-1)
+        k = idx(j,i);
+        diagVal = 1.0;
+        neigh = [j-1 i; j+1 i; j i-1; j i+1];
+        for q = 1:4
+            jj = neigh(q,1); ii = neigh(q,2);
+            D_face = 0.5 * (D_field(j,i) + D_field(jj,ii));
+            coef = dt * D_face / dx^2;
+            if jj == 1 || jj == ny || ii == 1 || ii == nx
+                rhs_extra(k) = rhs_extra(k) + coef*bath_value;
+            else
+                ptr = ptr + 1; rows(ptr)=k; cols(ptr)=idx(jj,ii); vals(ptr)=-coef;
+            end
+            diagVal = diagVal + coef;
+        end
+        ptr = ptr + 1; rows(ptr)=k; cols(ptr)=k; vals(ptr)=diagVal;
+    end
+end
+A = sparse(rows(1:ptr), cols(1:ptr), vals(1:ptr), N, N);
+end
+
+function out = diffuse_field(field, phase, D_intact, D_void_ratio, dt, dx, bath_value, C)
+[ny,nx] = size(field);
+phi = compute_porosity_field(phase, C.PHI_WINDOW, C);
+D_field = effective_diffusivity(phi, D_intact, D_void_ratio);
+[A, rhs_extra] = build_diffusion_matrix(D_field, dt, dx, bath_value);
+rhs = reshape(field(2:end-1,2:end-1), [], 1) + rhs_extra;
+internal = A \ rhs;
+internal = reshape(internal, ny-2, nx-2);
+out = field;
+out(1,:) = bath_value; out(end,:) = bath_value; out(:,1) = bath_value; out(:,end) = bath_value;
+out(2:end-1,2:end-1) = internal;
+out(out < 0) = 0;
+end
+
+function E = diffuse_E(E, phase, D_E_intact, D_E_void_ratio, dt, dx, C)
+E = diffuse_field(E, phase, D_E_intact, D_E_void_ratio, dt, dx, C.E_BATH, C);
+end
+
+function O = diffuse_oligomer(O, phase, D_O_poly, D_O_void_ratio, dt, dx, C)
+O = diffuse_field(O, phase, D_O_poly, D_O_void_ratio, dt, dx, C.O_BATH, C);
+end
+
+function Mn = recalc_Mn_from_Nk_cell(Nk_cell, C)
+Nk_cell = double(Nk_cell(:));
+k_vals = (0:(numel(Nk_cell)-1))';
+total_units = sum(k_vals .* Nk_cell);
+total_chains = sum(Nk_cell);
+if total_chains <= 0 || total_units <= 0
+    Mn = 0.0;
+else
+    Mn = C.M0_REPEAT * total_units / total_chains;
+end
+end
+
+function [Nk, Mn_field, did] = perform_chain_scission_full_Nk(Nk, Mn_field, j, i, C)
+cell = double(squeeze(Nk(j,i,:)));
+available = find(cell > 0) - 1;
+available = available(available >= C.M_SOL + 1);
+if isempty(available)
+    did = false;
+    return;
+end
+weights = cell(available+1);
+weights = weights ./ sum(weights);
+k_old = available(sample_discrete(weights));
+r = randi(k_old-1);
+Nk(j,i,k_old+1) = Nk(j,i,k_old+1) - int16(1);
+Nk(j,i,r+1) = Nk(j,i,r+1) + int16(1);
+Nk(j,i,k_old-r+1) = Nk(j,i,k_old-r+1) + int16(1);
+Mn_field(j,i) = recalc_Mn_from_Nk_cell(squeeze(Nk(j,i,:)), C);
+did = true;
+end
+
+function idx = sample_discrete(weights)
+c = cumsum(weights(:));
+u = rand();
+idx = find(u <= c, 1, 'first');
+if isempty(idx); idx = numel(weights); end
+end
+
+function [Nk, Mn_field, mass_field, O_field, soluble_fraction] = move_m8_oligomers_to_PDE(Nk, Mn_field, mass_field, O_field, j, i, N0_REPEAT, C)
+m = max(1, min(C.M_SOL, size(Nk,3)-1));
+small = double(squeeze(Nk(j,i,2:(m+1))));
+if sum(small) <= 0
+    soluble_fraction = 0.0;
+    return;
+end
+k_vals = (1:m)';
+soluble_units = sum(k_vals .* small(:));
+if soluble_units <= 0
+    soluble_fraction = 0.0;
+    return;
+end
+soluble_fraction = soluble_units / double(N0_REPEAT);
+mass_field(j,i) = max(0.0, mass_field(j,i) - soluble_fraction);
+O_field(j,i) = O_field(j,i) + soluble_fraction;
+Nk(j,i,2:(m+1)) = int16(0);
+Mn_field(j,i) = recalc_Mn_from_Nk_cell(squeeze(Nk(j,i,:)), C);
+end
+
+function Esum = von_neumann_enzyme_sum(E, C)
+Esum = zeros(size(E));
+Esum(2:end,:) = Esum(2:end,:) + E(1:end-1,:);
+Esum(1:end-1,:) = Esum(1:end-1,:) + E(2:end,:);
+Esum(:,2:end) = Esum(:,2:end) + E(:,1:end-1);
+Esum(:,1:end-1) = Esum(:,1:end-1) + E(:,2:end);
+Esum(1,:) = Esum(1,:) + C.E_BATH;
+Esum(end,:) = Esum(end,:) + C.E_BATH;
+Esum(:,1) = Esum(:,1) + C.E_BATH;
+Esum(:,end) = Esum(:,end) + C.E_BATH;
+end
+
+function mask = boundary_contact_mask(shape)
+ny = shape(1); nx = shape(2);
+mask = false(ny,nx);
+mask(1,:) = true; mask(end,:) = true; mask(:,1) = true; mask(:,end) = true;
+end
+
+function [phase, Mn_field, Nk, deg_origin, mass_field] = update_voids_from_Mnc_and_von_neumann_enzyme(phase, Mn_field, Nk, deg_origin, mass_field, Mnc, E_field, k_det, dt, C)
+E_neigh_sum = von_neumann_enzyme_sum(E_field, C);
+has_E_neigh = E_neigh_sum > C.ENZYME_NEIGHBOUR_THRESHOLD;
+boundary_contact = boundary_contact_mask(size(phase));
+eligible = (phase == C.S_DEG) & (boundary_contact | (Mn_field <= Mnc)) & has_E_neigh;
+E_neigh_mean = E_neigh_sum / 4.0;
+P_void = 1.0 - exp(-k_det .* E_neigh_mean .* dt);
+P_void = min(max(P_void,0.0),1.0);
+erode = eligible & (rand(size(phase)) < P_void);
+phase(erode) = C.S_VOID;
+Mn_field(erode) = 0.0;
+mass_field(erode) = 0.0;
+idx = find(erode);
+for kk = 1:size(Nk,3)
+    temp = Nk(:,:,kk);
+    temp(idx) = int16(0);
+    Nk(:,:,kk) = temp;
+end
+deg_origin(erode) = C.ORIGIN_NONE;
+end
+
+function [phase, bound, E_field, O_field, Mn_field, mass_field, Nk, deg_origin] = reaction_step(phase, bound, E_field, O_field, Mn_field, mass_field, Nk, deg_origin, thetaKin, dt, N0_REPEAT, C)
+k1 = thetaKin(1); k3 = thetaKin(2); k_conv = thetaKin(3); k_deg_C = thetaKin(4); k_deg_A = thetaKin(5); Mnc = thetaKin(6); k_det = thetaKin(7);
+[ny,nx] = size(phase);
+phase_old = phase;
+bound_old = bound;
+E_old = E_field;
+origin_old = deg_origin;
+dE_quantum = C.E_BATH / max(floor(ny*nx/100), 1);
+U1 = rand(ny,nx);
+U2 = rand(ny,nx);
+
+for j = 1:ny
+    for i = 1:nx
+        s = phase_old(j,i);
+        b = bound_old(j,i);
+        E_loc = E_old(j,i);
+        if s == C.S_VOID
+            continue;
+        end
+        u1 = U1(j,i); u2 = U2(j,i);
+        if s == C.S_DEG
+            origin = origin_old(j,i);
+            if origin == C.ORIGIN_C
+                rate = k_deg_C * E_loc;
+            elseif origin == C.ORIGIN_A
+                rate = k_deg_A * E_loc;
+            else
+                rate = 0.0;
+            end
+            P = 1.0 - exp(-rate * dt);
+            if u1 < P
+                [Nk, Mn_field, ~] = perform_chain_scission_full_Nk(Nk, Mn_field, j, i, C);
+            end
+            [Nk, Mn_field, mass_field, O_field, ~] = move_m8_oligomers_to_PDE(Nk, Mn_field, mass_field, O_field, j, i, N0_REPEAT, C);
+            continue;
+        end
+        if s == C.S_CRYST
+            if ~b
+                rate = k1 * E_loc;
+                P = 1.0 - exp(-rate * dt);
+                if u1 < P && E_loc > dE_quantum
+                    bound(j,i) = true;
+                    E_field(j,i) = E_field(j,i) - dE_quantum;
+                end
+            else
+                rates = [k_conv, k_deg_C];
+                r_tot = sum(rates);
+                if r_tot > 0
+                    P = 1.0 - exp(-r_tot * dt);
+                    if u1 < P
+                        cum = cumsum(rates) / r_tot;
+                        if u2 < cum(1)
+                            phase(j,i) = C.S_AMORPH;
+                        else
+                            phase(j,i) = C.S_DEG;
+                            deg_origin(j,i) = C.ORIGIN_C;
+                            [Nk, Mn_field, ~] = perform_chain_scission_full_Nk(Nk, Mn_field, j, i, C);
+                            [Nk, Mn_field, mass_field, O_field, ~] = move_m8_oligomers_to_PDE(Nk, Mn_field, mass_field, O_field, j, i, N0_REPEAT, C);
+                        end
+                        bound(j,i) = false;
+                        E_field(j,i) = E_field(j,i) + dE_quantum;
+                    end
+                end
+            end
+            continue;
+        end
+        if s == C.S_AMORPH
+            if ~b
+                rate = k3 * E_loc;
+                P = 1.0 - exp(-rate * dt);
+                if u1 < P && E_loc > dE_quantum
+                    bound(j,i) = true;
+                    E_field(j,i) = E_field(j,i) - dE_quantum;
+                end
+            else
+                rate = k_deg_A;
+                P = 1.0 - exp(-rate * dt);
+                if u1 < P
+                    phase(j,i) = C.S_DEG;
+                    deg_origin(j,i) = C.ORIGIN_A;
+                    [Nk, Mn_field, ~] = perform_chain_scission_full_Nk(Nk, Mn_field, j, i, C);
+                    [Nk, Mn_field, mass_field, O_field, ~] = move_m8_oligomers_to_PDE(Nk, Mn_field, mass_field, O_field, j, i, N0_REPEAT, C);
+                    bound(j,i) = false;
+                    E_field(j,i) = E_field(j,i) + dE_quantum;
+                end
+            end
+            continue;
+        end
+    end
+end
+
+[phase, Mn_field, Nk, deg_origin, mass_field] = update_voids_from_Mnc_and_von_neumann_enzyme(phase, Mn_field, Nk, deg_origin, mass_field, Mnc, E_field, k_det, dt, C);
+E_field(1,:) = C.E_BATH; E_field(end,:) = C.E_BATH; E_field(:,1) = C.E_BATH; E_field(:,end) = C.E_BATH;
+O_field(1,:) = C.O_BATH; O_field(end,:) = C.O_BATH; O_field(:,1) = C.O_BATH; O_field(:,end) = C.O_BATH;
+E_field(E_field < 0) = 0;
+O_field(O_field < 0) = 0;
+end
+
+% ============================================================
+% PREDICTION UNCERTAINTY + Q95 (deterministic across samples)
+% ============================================================
+function [predWL, predXC] = compute_predictions_CA(samples, data, C, tgrid)
+% Uses the FIXED likelihood seed for every forward run so the band
+% reflects parameter uncertainty rather than CA RNG noise.
+ns = size(samples,1);
+nt = numel(tgrid);
+predWL = zeros(ns,nt);
+predXC = zeros(ns,nt);
+for i = 1:ns
+    params = unpack_theta(samples(i,:));
+    [tSim, wlSim, xcSim, ~, ~] = run_hybrid_one_polymer(params, data.MN0, data.X_FIXED, max(tgrid), C.FIXED_LIK_SEED, tgrid, C);
+    predWL(i,:) = interp1(tSim, wlSim, tgrid, 'linear', 'extrap');
+    predXC(i,:) = interp1(tSim, xcSim, tgrid, 'linear', 'extrap');
+    if mod(i,max(1,floor(ns/10))) == 0
+        fprintf('Prediction runs: %d/%d\n', i, ns);
+    end
+end
+end
+
+function Q95 = compute_Q95_CA_WL(samples, bestParams, data, C, time)
+% Both the "best" and each "sample" forward run use the SAME fixed seed
+% so the log2 ratio reflects parameter difference only.
+paramsBest = unpack_theta(bestParams);
+[~, WLbest, ~, ~, ~] = run_hybrid_one_polymer(paramsBest, data.MN0, data.X_FIXED, max(time), C.FIXED_LIK_SEED, time, C);
+Q = nan(size(samples,1),1);
+for i = 1:size(samples,1)
+    params = unpack_theta(samples(i,:));
+    [~, WLi, ~, ~, ~] = run_hybrid_one_polymer(params, data.MN0, data.X_FIXED, max(time), C.FIXED_LIK_SEED, time, C);
+    valid = (WLi > 1e-8) & (WLbest > 1e-8);
+    if any(valid)
+        ld = log2(WLi(valid) ./ WLbest(valid));
+        Q(i) = sum(ld.^2);
+    end
+end
+Q = Q(isfinite(Q));
+if isempty(Q); Q95 = NaN; else; Q95 = prctile(Q,95); end
+end
+
+function Q95 = compute_Q95_CA_XC(samples, bestParams, data, C, time)
+paramsBest = unpack_theta(bestParams);
+[~, ~, XCbest, ~, ~] = run_hybrid_one_polymer(paramsBest, data.MN0, data.X_FIXED, max(time), C.FIXED_LIK_SEED, time, C);
+Q = nan(size(samples,1),1);
+for i = 1:size(samples,1)
+    params = unpack_theta(samples(i,:));
+    [~, ~, XCi, ~, ~] = run_hybrid_one_polymer(params, data.MN0, data.X_FIXED, max(time), C.FIXED_LIK_SEED, time, C);
+    valid = (XCi > 1e-8) & (XCbest > 1e-8);
+    if any(valid)
+        ld = log2(XCi(valid) ./ XCbest(valid));
+        Q(i) = sum(ld.^2);
+    end
+end
+Q = Q(isfinite(Q));
+if isempty(Q); Q95 = NaN; else; Q95 = prctile(Q,95); end
+end
+
+% ============================================================
+% DEMCz CORE (unchanged)
+% ============================================================
+function [saved_states, saved_logprob] = DEMCz(logtarget, states, Z, n, n_thin, blockindex, current_logprob, temperature_schedule, gamma_schedule, jitter)
+[m,d] = size(states);
+mZ0 = size(Z,1);
+if nargin < 10 || isempty(jitter); jitter = 1e-5 .* ones(1,d); end
+if nargin < 9 || isempty(gamma_schedule)
+    gamma_schedule = zeros(numel(blockindex),1);
+    for k = 1:numel(blockindex)
+        gamma_schedule(k) = 2.38 / sqrt(2 * numel(blockindex{k}));
+    end
+end
+if isvector(gamma_schedule); gamma_schedule = gamma_schedule(:); end
+if nargin < 8 || isempty(temperature_schedule); temperature_schedule = []; end
+if nargin < 7 || isempty(current_logprob)
+    current_logprob = zeros(m,1);
+    for j = 1:m
+        current_logprob(j) = logtarget(states(j,:));
+    end
+end
+if nargin < 6 || isempty(blockindex); blockindex = {1:d}; end
+if nargin < 5 || isempty(n_thin); n_thin = 1; end
+
+temperature_schedule = temperature_schedule(:);
+if numel(temperature_schedule) < n
+    temperature_schedule = [temperature_schedule; ones(n-numel(temperature_schedule),1)];
+end
+gamidx = mod(0:(n-1), size(gamma_schedule,2)) + 1;
+save_logprob = [];
+
+for it = 1:n
+    for j = 1:m
+        for k = 1:numel(blockindex)
+            idx = blockindex{k};
+            mZ = size(Z,1) - m;
+            if mZ < 2
+                n1 = randi(size(Z,1));
+                if size(Z,1) < 2
+                    n2 = n1;
+                else
+                    n2 = randi(size(Z,1)-1);
+                    if n2 >= n1; n2 = n2 + 1; end
+                end
+            else
+                n1 = randi(mZ);
+                n2 = randi(mZ-1);
+                if n2 >= n1; n2 = n2 + 1; end
+            end
+            diff = zeros(1,d);
+            gamma_k = gamma_schedule(k, gamidx(it));
+            diff(idx) = gamma_k .* (Z(n1,idx) - Z(n2,idx)) + jitter(idx).*randn(1,numel(idx));
+            proposal = states(j,:) + diff;
+            prop_logp = logtarget(proposal);
+            if isfinite(prop_logp) && (temperature_schedule(it) * log(rand) < (prop_logp - current_logprob(j)))
+                states(j,:) = proposal;
+                current_logprob(j) = prop_logp;
+            end
+        end
+    end
+    if mod(it,n_thin) == 0
+        Z = [Z; states]; %#ok<AGROW>
+        save_logprob = [save_logprob; current_logprob]; %#ok<AGROW>
+    end
+    if mod(it,max(1,floor(n/10))) == 0
+        fprintf('DE-MCz iteration %d/%d, mean logp = %.6g\n', it, n, mean(current_logprob(isfinite(current_logprob))));
+    end
+end
+
+if size(Z,1) > mZ0
+    saved_states = Z((mZ0+1):end,:);
+else
+    saved_states = [];
+end
+saved_logprob = save_logprob;
+end
+
+% ============================================================
+% PLOTS / SAVING
+% ============================================================
+function plot_parameter_CI(samples, labels, FS)
+means = mean(samples,1);
+lo = prctile(samples,2.5,1);
+hi = prctile(samples,97.5,1);
+n = size(samples,2);
+figure('Color','w','Position',[100 100 1200 650]); hold on; box on; grid on;
+for i = 1:n
+    rectangle('Position',[i-0.25, lo(i), 0.50, max(hi(i)-lo(i),0)], 'FaceColor',[0.3 0.6 0.9], 'EdgeColor',[0.3 0.6 0.9]);
+    plot([i-0.25 i+0.25], [means(i) means(i)], 'r-', 'LineWidth', 2);
+end
+xlim([0 n+1]);
+set(gca,'XTick',1:n,'XTickLabel',labels,'TickLabelInterpreter','latex','FontSize',FS-4);
+ylabel('Parameter value','FontSize',FS);
+legend({'95% CI','Mean'},'FontSize',FS-4,'Box','off');
+end
+
+function plot_pairwise(samples, best, labels, FS)
+n = size(samples,2);
+figure('Color','w','Position',[100 100 1300 1000]);
+for i = 1:(n-1)
+    subplot(ceil(sqrt(n-1)), ceil((n-1)/ceil(sqrt(n-1))), i); hold on; box on; grid on;
+    scatter(samples(:,i), samples(:,i+1), 15, 'b', 'filled', 'MarkerFaceAlpha', 0.25);
+    plot(best(i), best(i+1), 'r*', 'MarkerSize', 9, 'LineWidth', 1.5);
+    xlabel(labels{i}, 'Interpreter','latex','FontSize',FS-5);
+    ylabel(labels{i+1}, 'Interpreter','latex','FontSize',FS-5);
+    set(gca,'FontSize',FS-6);
+end
+end
+
+function save_fig(path, dpi)
+try
+    exportgraphics(gcf, path, 'Resolution', dpi);
+catch
+    print(gcf, path, '-dpng', ['-r' num2str(dpi)]);
+end
+fprintf('Saved: %s\n', path);
+end
