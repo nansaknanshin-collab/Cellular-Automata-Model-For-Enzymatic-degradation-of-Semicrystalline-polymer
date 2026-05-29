@@ -1,0 +1,360 @@
+function [Si_WL, Ti_WL, Si_Xc, Ti_Xc] = CA_Sobol_PCL6500()
+
+rng(123);
+stamp = datestr(now,'yyyymmdd_HHMMSS');
+downloads_dir = get_downloads_dir();
+outdir = fullfile(downloads_dir, ['CA_Sobol_PCL6500_' stamp]);
+if ~exist(outdir,'dir'), mkdir(outdir); end
+
+% -------------------- USER SETTINGS --------------------
+% Increase SAMPLE_POINTS to 256 or 512 for production-grade indices.
+TARGET_ROWS   = 10;       % 10 gives 10 x 333 grid for PCL6500
+SAMPLE_POINTS = 256;      % Saltelli base sample size, M
+N_REP         = 1;        % CA seed is reset deterministically per call
+EXPORT_DPI    = 600;
+
+time_points = [0 1 2 4 6 8 12 16 20];
+time_points = unique(time_points(:))';
+
+% -------------------- GRID --------------------
+BASE_ROWS = 10; BASE_COLS = 333; BASE_DX = 1.0;
+L_Y = BASE_ROWS * BASE_DX; L_X = BASE_COLS * BASE_DX;
+ROWS = TARGET_ROWS;
+DX = L_Y / TARGET_ROWS;
+COLS = round(L_X / DX);
+DT = 0.05;
+
+fprintf('\n================ CA SOBOL SETTINGS ================\n');
+fprintf('Output folder: %s\n', outdir);
+fprintf('Grid: %d x %d, DX = %.6f, DT = %.6f\n', ROWS, COLS, DX, DT);
+fprintf('Saltelli M = %d, p = 11, total CA runs = %d\n', SAMPLE_POINTS, (11+2)*SAMPLE_POINTS*N_REP);
+
+% -------------------- constants --------------------
+C.ROWS = ROWS; C.COLS = COLS; C.DX = DX; C.DT = DT;
+C.MN0 = 32944.57; C.X_FIXED = 0.60;
+C.S_CRYST = 1; C.S_AMORPH = 0; C.S_DEG = 2; C.S_VOID = -1;
+C.ORIGIN_NONE = 0; C.ORIGIN_C = 1; C.ORIGIN_A = 2;
+C.E_BATH = 1.0; C.O_BATH = 0.0;
+C.PHI_WINDOW = 1; C.M_SOL = 8; C.M0_REPEAT = 114.14;
+C.ENZYME_NEIGHBOUR_THRESHOLD = 1e-12;
+C.N_REP = N_REP; C.SEED_BASE = 5000;
+
+% -------------------- 11 CA parameters --------------------
+param_names = {'$k_1$', '$k_3$', '$k_{\mathrm{conv}}$', ...
+               '$k_{\mathrm{deg},C}$', '$k_{\mathrm{deg},A}$', ...
+               '$M_{nc}$', '$k_{\mathrm{det}}$', ...
+               '$D_{E,\mathrm{intact}}$', '$D_{E,\mathrm{void\,ratio}}$', ...
+               '$D_{O,\mathrm{poly}}$', '$D_{O,\mathrm{void\,ratio}}$'};
+short_names = {'k1','k3','k_conv','k_deg_C','k_deg_A','Mnc', ...
+               'k_det','D_E_intact','D_E_void_ratio','D_O_poly','D_O_void_ratio'};
+
+lb = [1e-6, 1e-6, 1e-8, 1e-6, 1e-6, 1e-6, 1e-6, 1e-4, 1.0, 1e-6, 1.0];
+ub = [2.0,  8.0,  1.0,  1.0,  3.0,  25000.0, 5.0, 50.0, 5.0, 50.0, 100.0];
+
+settings.model = @(theta) simulate_CA_mean(theta, time_points, C);
+settings.lower_bounds = lb;
+settings.upper_bounds = ub;
+settings.sample_points = SAMPLE_POINTS;
+
+out = saltelli_sobol_multioutput(settings);
+Nt = numel(time_points);
+
+Si_WL_raw = out.Si(1:Nt,:);
+Ti_WL_raw = out.Ti(1:Nt,:);
+Si_Xc_raw = out.Si(Nt+1:2*Nt,:);
+Ti_Xc_raw = out.Ti(Nt+1:2*Nt,:);
+
+Si_WL = max(min(Si_WL_raw, 1), 0);
+Ti_WL = max(min(Ti_WL_raw, 1), 0);
+Si_Xc = max(min(Si_Xc_raw, 1), 0);
+Ti_Xc = max(min(Ti_Xc_raw, 1), 0);
+
+% -------------------- save --------------------
+writematrix(time_points(:), fullfile(outdir, 'sobol_time_points_hours.csv'));
+writematrix(Si_WL_raw, fullfile(outdir, 'sobol_Si_weight_loss_raw.csv'));
+writematrix(Ti_WL_raw, fullfile(outdir, 'sobol_Ti_weight_loss_raw.csv'));
+writematrix(Si_Xc_raw, fullfile(outdir, 'sobol_Si_crystallinity_raw.csv'));
+writematrix(Ti_Xc_raw, fullfile(outdir, 'sobol_Ti_crystallinity_raw.csv'));
+writematrix(Si_WL, fullfile(outdir, 'sobol_Si_weight_loss_clipped.csv'));
+writematrix(Ti_WL, fullfile(outdir, 'sobol_Ti_weight_loss_clipped.csv'));
+writematrix(Si_Xc, fullfile(outdir, 'sobol_Si_crystallinity_clipped.csv'));
+writematrix(Ti_Xc, fullfile(outdir, 'sobol_Ti_crystallinity_clipped.csv'));
+
+excel_file = fullfile(outdir, 'CA_sobol_indices_PCL6500.xlsx');
+varnames = [{'Time_hours'}, short_names];
+
+writetable(array2table([time_points(:), Si_WL_raw], 'VariableNames', varnames), excel_file, 'Sheet', 'Si_WL_raw');
+writetable(array2table([time_points(:), Ti_WL_raw], 'VariableNames', varnames), excel_file, 'Sheet', 'Ti_WL_raw');
+writetable(array2table([time_points(:), Si_Xc_raw], 'VariableNames', varnames), excel_file, 'Sheet', 'Si_Xc_raw');
+writetable(array2table([time_points(:), Ti_Xc_raw], 'VariableNames', varnames), excel_file, 'Sheet', 'Ti_Xc_raw');
+writetable(array2table([time_points(:), Si_WL], 'VariableNames', varnames), excel_file, 'Sheet', 'Si_WL_clipped');
+writetable(array2table([time_points(:), Ti_WL], 'VariableNames', varnames), excel_file, 'Sheet', 'Ti_WL_clipped');
+writetable(array2table([time_points(:), Si_Xc], 'VariableNames', varnames), excel_file, 'Sheet', 'Si_Xc_clipped');
+writetable(array2table([time_points(:), Ti_Xc], 'VariableNames', varnames), excel_file, 'Sheet', 'Ti_Xc_clipped');
+
+writetable(table(lb(:), ub(:), 'VariableNames', {'lb','ub'}, 'RowNames', short_names(:)), excel_file, 'Sheet', 'bounds', 'WriteRowNames', true);
+
+markers = {'o','s','d','^','v','>','<','p','h','x','+'};
+plot_sobol_curves(time_points, Si_WL, param_names, markers, 'First-order Sobol index', 'Weight loss', fullfile(outdir, 'sobol_first_order_weight_loss.png'), EXPORT_DPI);
+plot_sobol_curves(time_points, Ti_WL, param_names, markers, 'Total-order Sobol index', 'Weight loss', fullfile(outdir, 'sobol_total_order_weight_loss.png'), EXPORT_DPI);
+plot_sobol_curves(time_points, Si_Xc, param_names, markers, 'First-order Sobol index', 'Crystallinity', fullfile(outdir, 'sobol_first_order_crystallinity.png'), EXPORT_DPI);
+plot_sobol_curves(time_points, Ti_Xc, param_names, markers, 'Total-order Sobol index', 'Crystallinity', fullfile(outdir, 'sobol_total_order_crystallinity.png'), EXPORT_DPI);
+
+fprintf('\nSaved Sobol outputs to:\n%s\n', outdir);
+end
+
+% =====================================================================
+function y = simulate_CA_mean(theta, time_points, C)
+theta = theta(:)';
+if any(theta <= 0) || theta(5) <= theta(4) || theta(2) <= theta(1) || ...
+        theta(6) < 0 || theta(6) > 25000 || theta(9) < 1 || theta(9) > 100 || theta(11) < 1 || theta(11) > 100
+    y = nan(1, 2*numel(time_points)); return;
+end
+WL = nan(C.N_REP, numel(time_points));
+Xc = nan(C.N_REP, numel(time_points));
+for r = 1:C.N_REP
+    [~, wl, xc] = run_CA_series(theta, time_points, C, C.SEED_BASE + r);
+    WL(r,:) = wl(:)'; Xc(r,:) = xc(:)';
+end
+y = [mean(WL,1,'omitnan'), mean(Xc,1,'omitnan')];
+end
+
+% =====================================================================
+function [t_record, wl_record, xc_record] = run_CA_series(theta, record_times, C, seed)
+rng(seed);
+ny = C.ROWS; nx = C.COLS;
+N0 = round(C.MN0 / C.M0_REPEAT); M_MAX = N0;
+R = rand(ny,nx); phase = C.S_AMORPH * ones(ny,nx); phase(R < C.X_FIXED) = C.S_CRYST;
+bound = false(ny,nx); deg_origin = C.ORIGIN_NONE * ones(ny,nx);
+Nk = zeros(ny,nx,M_MAX+1); Nk(:,:,N0+1) = 1;
+Mn = C.MN0 * ones(ny,nx); mass = ones(ny,nx); O = zeros(ny,nx);
+E = zeros(ny,nx); E(1,:) = C.E_BATH; E(end,:) = C.E_BATH; E(:,1) = C.E_BATH; E(:,end) = C.E_BATH;
+record_times = record_times(:)'; t_record = record_times; t_end = max(record_times);
+wl_record = nan(size(record_times)); xc_record = nan(size(record_times));
+[wl_record(1), xc_record(1)] = compute_metrics(phase, mass, O, C);
+t = 0; next_idx = 2;
+while t < t_end - 1e-12
+    E = diffuse_field(E, phase, theta(8), theta(9), C.DT, C.DX, C.E_BATH, C);
+    O = diffuse_field(O, phase, theta(10), theta(11), C.DT, C.DX, C.O_BATH, C);
+    [phase,bound,E,O,Mn,mass,Nk,deg_origin] = reaction_step(phase,bound,E,O,Mn,mass,Nk,deg_origin,theta,C.DT,N0,C);
+    t = t + C.DT;
+    while next_idx <= numel(record_times) && record_times(next_idx) <= t + 1e-12
+        [wl_record(next_idx), xc_record(next_idx)] = compute_metrics(phase, mass, O, C);
+        next_idx = next_idx + 1;
+    end
+end
+missing = isnan(wl_record) | isnan(xc_record);
+if any(missing), [wl,xc] = compute_metrics(phase, mass, O, C); wl_record(missing)=wl; xc_record(missing)=xc; end
+end
+
+% =====================================================================
+function [phase,bound,E,O,Mn,mass,Nk,origin] = reaction_step(phase,bound,E,O,Mn,mass,Nk,origin,theta,dt,N0,C)
+k1=theta(1); k3=theta(2); kconv=theta(3); kdegC=theta(4); kdegA=theta(5); Mnc=theta(6); kdet=theta(7);
+[ny,nx] = size(phase); ph0=phase; bd0=bound; E0=E; og0=origin;
+dEq = C.E_BATH / max(floor(ny*nx/100),1);
+U1=rand(ny,nx); U2=rand(ny,nx);
+for j=1:ny
+    for i=1:nx
+        s=ph0(j,i); if s==C.S_VOID, continue; end
+        b=bd0(j,i); El=E0(j,i); u1=U1(j,i); u2=U2(j,i);
+        if s==C.S_DEG
+            og=og0(j,i);
+            if og==C.ORIGIN_C, rate=kdegC*El; elseif og==C.ORIGIN_A, rate=kdegA*El; else, rate=0; end
+            if u1 < 1-exp(-rate*dt), [Nk,Mn]=scission(Nk,Mn,j,i,C); end
+            [Nk,Mn,mass,O]=move_oligomers(Nk,Mn,mass,O,j,i,N0,C);
+        elseif s==C.S_CRYST
+            if ~b
+                if u1 < 1-exp(-k1*El*dt) && El>dEq, bound(j,i)=true; E(j,i)=E(j,i)-dEq; end
+            else
+                rates=[kconv,kdegC]; rt=sum(rates);
+                if rt>0 && u1 < 1-exp(-rt*dt)
+                    cum=cumsum(rates)/rt;
+                    if u2 < cum(1)
+                        phase(j,i)=C.S_AMORPH;
+                    else
+                        phase(j,i)=C.S_DEG; origin(j,i)=C.ORIGIN_C;
+                        [Nk,Mn]=scission(Nk,Mn,j,i,C);
+                        [Nk,Mn,mass,O]=move_oligomers(Nk,Mn,mass,O,j,i,N0,C);
+                    end
+                    bound(j,i)=false; E(j,i)=E(j,i)+dEq;
+                end
+            end
+        elseif s==C.S_AMORPH
+            if ~b
+                if u1 < 1-exp(-k3*El*dt) && El>dEq, bound(j,i)=true; E(j,i)=E(j,i)-dEq; end
+            else
+                if u1 < 1-exp(-kdegA*dt)
+                    phase(j,i)=C.S_DEG; origin(j,i)=C.ORIGIN_A;
+                    [Nk,Mn]=scission(Nk,Mn,j,i,C);
+                    [Nk,Mn,mass,O]=move_oligomers(Nk,Mn,mass,O,j,i,N0,C);
+                    bound(j,i)=false; E(j,i)=E(j,i)+dEq;
+                end
+            end
+        end
+    end
+end
+[phase,Mn,Nk,origin,mass] = update_voids(phase,Mn,Nk,origin,mass,Mnc,E,kdet,dt,C);
+E(1,:)=C.E_BATH; E(end,:)=C.E_BATH; E(:,1)=C.E_BATH; E(:,end)=C.E_BATH;
+O(1,:)=C.O_BATH; O(end,:)=C.O_BATH; O(:,1)=C.O_BATH; O(:,end)=C.O_BATH;
+E=max(E,0); O=max(O,0);
+end
+
+% =====================================================================
+function [phase,Mn,Nk,origin,mass] = update_voids(phase,Mn,Nk,origin,mass,Mnc,E,kdet,dt,C)
+Es = vn_enzyme_sum(E,C); hasE = Es > C.ENZYME_NEIGHBOUR_THRESHOLD;
+boundary = boundary_mask(size(phase));
+eligible = (phase==C.S_DEG) & (boundary | (Mn <= Mnc)) & hasE;
+Pv = min(max(1-exp(-kdet*(Es/4)*dt),0),1);
+erode = eligible & (rand(size(phase)) < Pv);
+phase(erode)=C.S_VOID; Mn(erode)=0; mass(erode)=0; origin(erode)=C.ORIGIN_NONE;
+[rr,cc]=find(erode); for q=1:numel(rr), Nk(rr(q),cc(q),:)=0; end
+end
+
+% =====================================================================
+function out = diffuse_field(field, phase, Dintact, Dratio, dt, dx, bath, C)
+phi = porosity(phase,C.PHI_WINDOW,C); D = Dintact*(1+(Dratio-1)*phi);
+[A,rhs_extra]=diffusion_matrix(D,dt,dx,bath);
+rhs = field(2:end-1,2:end-1); sol = A \ (rhs(:)+rhs_extra);
+out = field; out(1,:)=bath; out(end,:)=bath; out(:,1)=bath; out(:,end)=bath;
+[ny,nx]=size(field); out(2:end-1,2:end-1)=reshape(sol,ny-2,nx-2); out=max(out,0);
+end
+
+function [A,rhs_extra] = diffusion_matrix(D,dt,dx,bath)
+[ny,nx]=size(D); nr=ny-2; nc=nx-2; N=nr*nc;
+rows=zeros(5*N,1); cols=zeros(5*N,1); vals=zeros(5*N,1); rhs_extra=zeros(N,1); c=0;
+idx=@(j,i) (j-2)*nc + (i-1);
+for j=2:ny-1
+    for i=2:nx-1
+        k=idx(j,i); diagv=1; neigh=[j-1 i; j+1 i; j i-1; j i+1];
+        for q=1:4
+            jj=neigh(q,1); ii=neigh(q,2); Dface=0.5*(D(j,i)+D(jj,ii)); coef=dt*Dface/dx^2;
+            if jj==1 || jj==ny || ii==1 || ii==nx
+                rhs_extra(k)=rhs_extra(k)+coef*bath;
+            else
+                c=c+1; rows(c)=k; cols(c)=idx(jj,ii); vals(c)=-coef;
+            end
+            diagv=diagv+coef;
+        end
+        c=c+1; rows(c)=k; cols(c)=k; vals(c)=diagv;
+    end
+end
+A=sparse(rows(1:c),cols(1:c),vals(1:c),N,N);
+end
+
+function phi = porosity(phase,window,C)
+void = double(phase==C.S_VOID); [ny,nx]=size(phase); pad=max(round(window),1);
+padded=ones(ny+2*pad,nx+2*pad); padded(pad+1:pad+ny,pad+1:pad+nx)=void;
+phi=zeros(ny,nx); w=2*pad+1;
+for dj=-pad:pad
+    for di=-pad:pad
+        phi=phi+padded(pad+1+dj:pad+ny+dj,pad+1+di:pad+nx+di);
+    end
+end
+phi=phi/(w*w);
+end
+
+% =====================================================================
+function [Nk,Mn]=scission(Nk,Mn,j,i,C)
+cell=squeeze(Nk(j,i,:))'; idxs=find(cell>0); ks=idxs-1; keep=ks>=2; idxs=idxs(keep); ks=ks(keep);
+if isempty(ks), return; end
+w=cell(idxs); w=w/sum(w); pick=weighted_choice(w); kold=ks(pick); oldidx=kold+1; r=randi([1,kold-1]); k2=kold-r;
+Nk(j,i,oldidx)=Nk(j,i,oldidx)-1; Nk(j,i,r+1)=Nk(j,i,r+1)+1; Nk(j,i,k2+1)=Nk(j,i,k2+1)+1;
+Mn(j,i)=calc_Mn(squeeze(Nk(j,i,:)),C);
+end
+
+function [Nk,Mn,mass,O]=move_oligomers(Nk,Mn,mass,O,j,i,N0,C)
+m=max(1,min(C.M_SOL,size(Nk,3)-1)); small=squeeze(Nk(j,i,2:m+1))';
+if sum(small)<=0, return; end
+units=sum((1:m).*small); if units<=0, return; end
+frac=units/N0; mass(j,i)=max(0,mass(j,i)-frac); O(j,i)=O(j,i)+frac; Nk(j,i,2:m+1)=0; Mn(j,i)=calc_Mn(squeeze(Nk(j,i,:)),C);
+end
+
+function Mn=calc_Mn(Nkcell,C)
+Nkcell=Nkcell(:)'; ks=0:(numel(Nkcell)-1); units=sum(ks.*Nkcell); chains=sum(Nkcell);
+if chains<=0 || units<=0, Mn=0; else, Mn=C.M0_REPEAT*units/chains; end
+end
+
+function idx=weighted_choice(w)
+c=cumsum(w(:)); idx=find(rand()*c(end)<=c,1,'first');
+end
+
+% =====================================================================
+function [wl,xc] = compute_metrics(phase, mass, O, C)
+% Mass-based observables matching the manuscript (Model Outputs section):
+%   WL  = 1 - (sum(mass) + sum(O))/N_total                  (scaled to %)
+%   X_c = M_C / (M_C + M_A + M_D + M_G)                     (scaled to %)
+% with M_phase = sum of remaining insoluble mass in cells of that phase
+% and M_G = sum of soluble oligomers still inside the film.
+% Eroded S_VOID cells have mass = 0 and contribute nothing.
+
+N_initial = numel(phase);
+
+mC = sum(mass(phase==C.S_CRYST), 'all');
+mA = sum(mass(phase==C.S_AMORPH), 'all');
+mD = sum(mass(phase==C.S_DEG), 'all');
+mO_inside = sum(O, 'all');
+
+total_remaining_mass = mC + mA + mD + mO_inside;
+
+wl = 100 * (1 - total_remaining_mass / N_initial);
+wl = max(min(wl, 100), 0);
+
+if total_remaining_mass > 0
+    xc = 100 * mC / total_remaining_mass;
+else
+    xc = 0;
+end
+end
+
+function Es=vn_enzyme_sum(E,C)
+Es=zeros(size(E)); Es(2:end,:)=Es(2:end,:)+E(1:end-1,:); Es(1:end-1,:)=Es(1:end-1,:)+E(2:end,:); Es(:,2:end)=Es(:,2:end)+E(:,1:end-1); Es(:,1:end-1)=Es(:,1:end-1)+E(:,2:end);
+Es(1,:)=Es(1,:)+C.E_BATH; Es(end,:)=Es(end,:)+C.E_BATH; Es(:,1)=Es(:,1)+C.E_BATH; Es(:,end)=Es(:,end)+C.E_BATH;
+end
+
+function m=boundary_mask(sz)
+m=false(sz); m(1,:)=true; m(end,:)=true; m(:,1)=true; m(:,end)=true;
+end
+
+% =====================================================================
+function out=saltelli_sobol_multioutput(settings)
+model=settings.model; lb=settings.lower_bounds(:)'; ub=settings.upper_bounds(:)'; M=settings.sample_points; p=numel(lb);
+rng(123); sob=sobolset(p,'Skip',1e3,'Leap',1e2); sob=scramble(sob,'MatousekAffineOwen'); AB=net(sob,2*M);
+A=lb+AB(1:M,:).*(ub-lb); B=lb+AB(M+1:2*M,:).*(ub-lb);
+Cmat=zeros(M,p,p); for j=1:p, Cmat(:,:,j)=B; Cmat(:,j,j)=A(:,j); end
+ytest=model(A(1,:)); nout=numel(ytest); yA=nan(M,nout); yB=nan(M,nout); yC=nan(M,p,nout);
+t0=tic;
+for i=1:M
+    yA(i,:)=model(A(i,:)); yB(i,:)=model(B(i,:));
+    if mod(i,max(1,floor(M/10)))==0, fprintf('A/B evaluations: %d/%d, %.1f s\n',i,M,toc(t0)); end
+end
+for j=1:p
+    fprintf('Evaluating C_j parameter %d/%d...\n',j,p);
+    for i=1:M, yC(i,j,:)=reshape(model(Cmat(i,:,j)),1,1,nout); end
+end
+valid=all(isfinite(yA),2)&all(isfinite(yB),2); for j=1:p, valid=valid&all(isfinite(squeeze(yC(:,j,:))),2); end
+fprintf('Sobol valid samples: %d / %d\n',sum(valid),M);
+if sum(valid)<max(5,floor(0.15*M)), error('Too many failed CA evaluations. Tighten bounds or reparameterise constraints.'); end
+yA=yA(valid,:); yB=yB(valid,:); yC=yC(valid,:,:);
+f0=mean([yA;yB],1); var_y=max(var([yA;yB],1,1),eps); Si=zeros(nout,p); Ti=zeros(nout,p);
+for j=1:p
+    yCj=squeeze(yC(:,j,:));
+    Si(:,j)=((mean(yA.*yCj,1)-f0.^2)./var_y)';
+    Ti(:,j)=(1-(mean(yB.*yCj,1)-f0.^2)./var_y)';
+end
+out.Si=Si; out.Ti=Ti;
+end
+
+function plot_sobol_curves(t,S,param_names,markers,ylab,~,outpath,dpi)
+fig=figure('Color','w','Position',[100 100 1000 620]); hold on; box on; grid on;
+for j=1:size(S,2)
+    plot(t,S(:,j),['-' markers{j}],'LineWidth',2.5,'MarkerSize',6,'MarkerIndices',1:numel(t),'DisplayName',param_names{j});
+end
+xlabel('Time (h)','FontSize',18); ylabel(ylab,'Interpreter','latex','FontSize',18); ylim([0 1]); set(gca,'FontSize',15);
+lgd=legend(param_names,'Interpreter','latex','FontSize',10,'NumColumns',4); lgd.Location='northoutside'; lgd.Box='off';
+exportgraphics(fig,outpath,'Resolution',dpi);
+end
+
+function ddir=get_downloads_dir()
+if ispc, ddir=fullfile(getenv('USERPROFILE'),'Downloads'); else, ddir=fullfile(getenv('HOME'),'Downloads'); end
+if ~exist(ddir,'dir'), mkdir(ddir); end
+end
