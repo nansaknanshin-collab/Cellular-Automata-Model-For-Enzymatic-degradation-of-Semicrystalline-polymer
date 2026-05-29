@@ -7,7 +7,7 @@ outdir = fullfile(downloads_dir, ['CA_Sobol_PCL6500_' stamp]);
 if ~exist(outdir,'dir'), mkdir(outdir); end
 
 % -------------------- USER SETTINGS --------------------
-% Increase SAMPLE_POINTS to 256 or 512 for production-grade indices.
+% Increase SAMPLE_POINTS if computer resources allow.
 TARGET_ROWS   = 10;       % 10 gives 10 x 333 grid for PCL6500
 SAMPLE_POINTS = 256;      % Saltelli base sample size, M
 N_REP         = 1;        % CA seed is reset deterministically per call
