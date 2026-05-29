@@ -1,0 +1,1188 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from datetime import datetime
+from scipy.interpolate import PchipInterpolator
+from matplotlib.ticker import MaxNLocator
+from scipy.sparse.linalg import spsolve
+from scipy.optimize import minimize
+from scipy.sparse import csr_matrix
+from pyswarms.single.global_best import GlobalBestPSO
+
+
+# ============================================================
+# OUTPUT FOLDER
+# ============================================================
+DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+OUTPUT_DIR = os.path.join(
+    DOWNLOADS_DIR,
+    "Hybrid_CA_PDE_PCL6300_NormalJointLS_BoundaryErosion"
+)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"Results will be saved in:\n{OUTPUT_DIR}")
+
+
+# ============================================================
+# 0) DATA: THREE PCL GRADES, NO ERROR BARS
+#    Joint fit uses ONLY weight loss and crystallinity.
+#    Objective is ordinary unweighted least squares.
+# ============================================================
+# Select ONE polymer here: "PCL6300", "PCL6500", or "PCL6800".
+SELECTED_POLYMER = "PCL6300"
+
+ALL_POLYMER_DATA = {
+    "PCL6300": {
+        "MN0": 15723.72,
+        "X_FIXED": 0.65,
+        "t_xc": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "xc_obs": np.array([65, 62, 59, 51, 35, 9, 8.8, 8, 6], float) / 100.0,
+        "t_wl": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "wl_obs": np.array([0, 9, 18, 38, 54, 67, 85, 86, 87], float) / 100.0,
+    },
+    "PCL6500": {
+        "MN0": 32944.57,
+        "X_FIXED": 0.60,
+        "t_xc": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "xc_obs": np.array([60, 59, 56, 49, 36, 5, 4, 3, 2], float) / 100.0,
+        "t_wl": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "wl_obs": np.array([0, 9, 16, 38, 54, 70, 82, 83, 84], float) / 100.0,
+    },
+    "PCL6800": {
+        "MN0": 40931.18,
+        "X_FIXED": 0.60,
+        "t_xc": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "xc_obs": np.array([60, 58, 56, 52, 36, 5, 3.5, 3, 2], float) / 100.0,
+        "t_wl": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "wl_obs": np.array([0, 11, 23, 43, 61, 70, 83, 84, 85], float) / 100.0,
+    },
+}
+
+POLYMER_DATA = {
+    SELECTED_POLYMER: ALL_POLYMER_DATA[SELECTED_POLYMER]
+}
+USE_MW_IN_OBJECTIVE = False
+
+
+# ============================================================
+# 1) FIXED PHYSICAL DOMAIN + GRID REFINEMENT
+# ============================================================
+BASE_ROWS = 10
+BASE_COLS = 333
+BASE_DX = 1.0
+
+L_Y = BASE_ROWS * BASE_DX
+L_X = BASE_COLS * BASE_DX
+
+TARGET_ROWS = 40
+DX = L_Y / TARGET_ROWS
+ROWS = int(TARGET_ROWS)
+COLS = int(round(L_X / DX))
+
+DT = 0.05
+
+S_CRYST = 1
+S_AMORPH = 0
+S_DEG = 2
+S_VOID = -1
+
+ORIGIN_NONE = 0
+ORIGIN_C = 1
+ORIGIN_A = 2
+
+E_BATH = 1.0
+O_BATH = 0.0
+PHI_WINDOW = 1
+M_SOL = 8
+M0_REPEAT = 114.14
+
+SEED = 42
+N_REP = 1
+SEEDS = [SEED + i for i in range(N_REP)]
+ENZYME_NEIGHBOUR_THRESHOLD = 1e-12
+
+print("\n================ GRID REFINEMENT ================")
+print(f"Baseline grid: {BASE_ROWS} x {BASE_COLS}")
+print(f"Baseline DX: {BASE_DX}")
+print(f"Fixed physical size: L_Y = {L_Y}, L_X = {L_X}")
+print(f"Current grid: {ROWS} x {COLS}")
+print(f"DX = {DX:.6f}")
+print(f"Actual physical size: {ROWS * DX:.6f} x {COLS * DX:.6f}")
+print(f"M_SOL = {M_SOL} repeat units")
+
+
+# ============================================================
+# 2) POROSITY-DEPENDENT DIFFUSIVITY
+# ============================================================
+def compute_porosity_field(phase, window):
+    void_only = (phase == S_VOID).astype(float)
+    ny, nx = phase.shape
+    phi = np.zeros_like(void_only, dtype=float)
+
+    pad = max(int(window), 1)
+    padded_void = np.pad(
+        void_only,
+        pad_width=pad,
+        mode="constant",
+        constant_values=1.0
+    )
+
+    w = 2 * pad + 1
+
+    for dj in range(-pad, pad + 1):
+        for di in range(-pad, pad + 1):
+            phi += padded_void[
+                pad + dj:pad + dj + ny,
+                pad + di:pad + di + nx
+            ]
+
+    phi /= float(w * w)
+    return phi
+
+
+def effective_diffusivity(phi, D_intact, D_void_ratio):
+    return D_intact * (1.0 + (D_void_ratio - 1.0) * phi)
+
+
+# ============================================================
+# 3) SAME-GRID FOUR-SIDED DIFFUSION PDE
+# ============================================================
+def build_diffusion_matrix(D_field, dt, dx, bath_value):
+    ny, nx = D_field.shape
+
+    n_solve_rows = ny - 2
+    n_solve_cols = nx - 2
+
+    if n_solve_rows <= 0 or n_solve_cols <= 0:
+        raise ValueError("ROWS and COLS must both be at least 3.")
+
+    N = n_solve_rows * n_solve_cols
+
+    def idx(j, i):
+        return (j - 1) * n_solve_cols + (i - 1)
+
+    rows, cols, vals = [], [], []
+    rhs_extra = np.zeros(N)
+
+    for j in range(1, ny - 1):
+        for i in range(1, nx - 1):
+            k = idx(j, i)
+            diag_val = 1.0
+
+            for dj, di in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                jj, ii = j + dj, i + di
+
+                D_face = 0.5 * (D_field[j, i] + D_field[jj, ii])
+                coef = dt * D_face / dx**2
+
+                if jj == 0 or jj == ny - 1 or ii == 0 or ii == nx - 1:
+                    rhs_extra[k] += coef * bath_value
+                else:
+                    rows.append(k)
+                    cols.append(idx(jj, ii))
+                    vals.append(-coef)
+
+                diag_val += coef
+
+            rows.append(k)
+            cols.append(k)
+            vals.append(diag_val)
+
+    A = csr_matrix((vals, (rows, cols)), shape=(N, N))
+    return A, rhs_extra
+
+
+def diffuse_field(field, phase, D_intact, D_void_ratio, dt, dx, bath_value):
+    ny, nx = field.shape
+
+    phi = compute_porosity_field(phase, window=PHI_WINDOW)
+    D_field = effective_diffusivity(phi, D_intact, D_void_ratio)
+
+    A, rhs_extra = build_diffusion_matrix(
+        D_field,
+        dt,
+        dx,
+        bath_value=bath_value
+    )
+
+    rhs = field[1:-1, 1:-1].flatten() + rhs_extra
+    internal_new = spsolve(A, rhs).reshape(ny - 2, nx - 2)
+
+    out = field.copy()
+    out[0, :] = bath_value
+    out[-1, :] = bath_value
+    out[:, 0] = bath_value
+    out[:, -1] = bath_value
+    out[1:-1, 1:-1] = internal_new
+
+    np.clip(out, 0.0, None, out=out)
+    return out
+
+
+def diffuse_E(E_field, phase, D_E_intact, D_E_void_ratio, dt, dx):
+    return diffuse_field(
+        E_field,
+        phase,
+        D_E_intact,
+        D_E_void_ratio,
+        dt,
+        dx,
+        E_BATH
+    )
+
+
+def diffuse_oligomer(O_field, phase, D_O_poly, D_O_void_ratio, dt, dx):
+    return diffuse_field(
+        O_field,
+        phase,
+        D_O_poly,
+        D_O_void_ratio,
+        dt,
+        dx,
+        O_BATH
+    )
+
+
+# ============================================================
+# 4) MOLECULAR WEIGHT + CHAIN TRACKING
+# ============================================================
+def recalc_Mn_from_Nk_cell(Nk_cell):
+    k_vals = np.arange(Nk_cell.size, dtype=float)
+    total_units = np.sum(k_vals * Nk_cell)
+    total_chains = np.sum(Nk_cell)
+
+    if total_chains <= 0 or total_units <= 0:
+        return 0.0
+
+    return M0_REPEAT * total_units / total_chains
+
+
+def perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng):
+    Nk_cell = Nk[j, i, :]
+
+    # Only insoluble chains are eligible for further scission.
+    # Chains with length k <= M_SOL are treated as soluble oligomers
+    # and are transferred to the oligomer field by move_m8_oligomers_to_PDE.
+    available = np.where(Nk_cell > 0)[0]
+    available = available[available >= M_SOL + 1]
+
+    if available.size == 0:
+        return False
+
+    weights = Nk_cell[available].astype(float)
+    weights /= np.sum(weights)
+
+    k_old = int(rng.choice(available, p=weights))
+    r = int(rng.integers(1, k_old))
+
+    Nk[j, i, k_old] -= 1
+    Nk[j, i, r] += 1
+    Nk[j, i, k_old - r] += 1
+
+    Mn_field[j, i] = recalc_Mn_from_Nk_cell(Nk[j, i, :])
+    return True
+
+
+def move_m8_oligomers_to_PDE(
+    Nk,
+    Mn_field,
+    mass_field,
+    O_field,
+    j,
+    i,
+    N0_REPEAT,
+    m_sol=M_SOL
+):
+    m = int(max(1, min(m_sol, Nk.shape[2] - 1)))
+
+    small_counts = Nk[j, i, 1:m + 1].astype(float)
+
+    if np.sum(small_counts) <= 0:
+        return 0.0
+
+    k_vals = np.arange(1, m + 1, dtype=float)
+    soluble_units = float(np.sum(k_vals * small_counts))
+
+    if soluble_units <= 0.0:
+        return 0.0
+
+    soluble_fraction = soluble_units / float(N0_REPEAT)
+
+    mass_field[j, i] = max(0.0, mass_field[j, i] - soluble_fraction)
+    O_field[j, i] += soluble_fraction
+
+    Nk[j, i, 1:m + 1] = 0
+    Mn_field[j, i] = recalc_Mn_from_Nk_cell(Nk[j, i, :])
+
+    return soluble_fraction
+
+
+# ============================================================
+# 5) VON NEUMANN ENZYME NEIGHBOURHOOD FOR EROSION
+# ============================================================
+def von_neumann_enzyme_sum(E_field):
+    Esum = np.zeros_like(E_field, dtype=float)
+
+    Esum[1:, :] += E_field[:-1, :]
+    Esum[:-1, :] += E_field[1:, :]
+    Esum[:, 1:] += E_field[:, :-1]
+    Esum[:, :-1] += E_field[:, 1:]
+
+    Esum[0, :] += E_BATH
+    Esum[-1, :] += E_BATH
+    Esum[:, 0] += E_BATH
+    Esum[:, -1] += E_BATH
+
+    return Esum
+
+
+def boundary_contact_mask(shape):
+    """
+    True for cells directly in contact with the external enzyme bath.
+    These are the physical film boundary cells.
+    """
+    ny, nx = shape
+    mask = np.zeros((ny, nx), dtype=bool)
+    mask[0, :] = True
+    mask[-1, :] = True
+    mask[:, 0] = True
+    mask[:, -1] = True
+    return mask
+
+
+def update_voids_from_Mnc_and_von_neumann_enzyme(
+    phase,
+    Mn_field,
+    Nk,
+    deg_origin,
+    mass_field,
+    Mnc,
+    E_field,
+    k_det,
+    rng,
+    dt
+):
+    E_neigh_sum = von_neumann_enzyme_sum(E_field)
+    has_E_neigh = E_neigh_sum > ENZYME_NEIGHBOUR_THRESHOLD
+
+    boundary_contact = boundary_contact_mask(phase.shape)
+
+    # Boundary degraded cells do NOT have to wait until Mn <= Mnc.
+    # They become eligible immediately after degradation because they are
+    # directly exposed to the external enzyme medium.
+    #
+    # Interior degraded cells still require Mn <= Mnc.
+    eligible = (
+        (phase == S_DEG)
+        &
+        (
+            boundary_contact
+            | (Mn_field <= Mnc)
+        )
+        &
+        has_E_neigh
+    )
+
+    # Erosion is still probabilistic, not instantaneous.
+    E_neigh_mean = E_neigh_sum / 4.0
+    P_void = 1.0 - np.exp(-k_det * E_neigh_mean * dt)
+    P_void = np.clip(P_void, 0.0, 1.0)
+
+    erode = eligible & (rng.random(phase.shape) < P_void)
+
+    phase[erode] = S_VOID
+    Mn_field[erode] = 0.0
+    mass_field[erode] = 0.0
+    Nk[erode, :] = 0
+    deg_origin[erode] = ORIGIN_NONE
+
+# ============================================================
+# 6) CA REACTION STEP
+# ============================================================
+def reaction_step(
+    phase,
+    bound,
+    E_field,
+    O_field,
+    Mn_field,
+    mass_field,
+    Nk,
+    deg_origin,
+    params,
+    rng,
+    dt,
+    N0_REPEAT
+):
+    k1, k3, k_conv, k_deg_C, k_deg_A, Mnc, k_det = params
+
+    ny, nx = phase.shape
+
+    phase_old = phase.copy()
+    bound_old = bound.copy()
+    E_old = E_field.copy()
+    origin_old = deg_origin.copy()
+
+    dE_quantum = E_BATH / max(ny * nx // 100, 1)
+
+    U1 = rng.random((ny, nx))
+    U2 = rng.random((ny, nx))
+
+    for j in range(ny):
+        for i in range(nx):
+            s = phase_old[j, i]
+            b = bound_old[j, i]
+            E_loc = E_old[j, i]
+
+            if s == S_VOID:
+                continue
+
+            u1 = U1[j, i]
+            u2 = U2[j, i]
+
+            if s == S_DEG:
+                origin = origin_old[j, i]
+
+                if origin == ORIGIN_C:
+                    rate = k_deg_C * E_loc
+                elif origin == ORIGIN_A:
+                    rate = k_deg_A * E_loc
+                else:
+                    rate = 0.0
+
+                P = 1.0 - np.exp(-rate * dt)
+
+                if u1 < P:
+                    perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng)
+
+                move_m8_oligomers_to_PDE(
+                    Nk,
+                    Mn_field,
+                    mass_field,
+                    O_field,
+                    j,
+                    i,
+                    N0_REPEAT
+                )
+
+                continue
+
+            if s == S_CRYST:
+                if not b:
+                    rate = k1 * E_loc
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P and E_loc > dE_quantum:
+                        bound[j, i] = True
+                        E_field[j, i] -= dE_quantum
+
+                else:
+                    rates = np.array([k_conv, k_deg_C], dtype=float)
+                    r_tot = np.sum(rates)
+
+                    if r_tot > 0:
+                        P = 1.0 - np.exp(-r_tot * dt)
+
+                        if u1 < P:
+                            cum = np.cumsum(rates) / r_tot
+
+                            if u2 < cum[0]:
+                                phase[j, i] = S_AMORPH
+                            else:
+                                phase[j, i] = S_DEG
+                                deg_origin[j, i] = ORIGIN_C
+
+                                perform_chain_scission_full_Nk(
+                                    Nk,
+                                    Mn_field,
+                                    j,
+                                    i,
+                                    rng
+                                )
+
+                                move_m8_oligomers_to_PDE(
+                                    Nk,
+                                    Mn_field,
+                                    mass_field,
+                                    O_field,
+                                    j,
+                                    i,
+                                    N0_REPEAT
+                                )
+
+                            bound[j, i] = False
+                            E_field[j, i] += dE_quantum
+
+                continue
+
+            if s == S_AMORPH:
+                if not b:
+                    rate = k3 * E_loc
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P and E_loc > dE_quantum:
+                        bound[j, i] = True
+                        E_field[j, i] -= dE_quantum
+
+                else:
+                    rate = k_deg_A
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P:
+                        phase[j, i] = S_DEG
+                        deg_origin[j, i] = ORIGIN_A
+
+                        perform_chain_scission_full_Nk(
+                            Nk,
+                            Mn_field,
+                            j,
+                            i,
+                            rng
+                        )
+
+                        move_m8_oligomers_to_PDE(
+                            Nk,
+                            Mn_field,
+                            mass_field,
+                            O_field,
+                            j,
+                            i,
+                            N0_REPEAT
+                        )
+
+                        bound[j, i] = False
+                        E_field[j, i] += dE_quantum
+
+                continue
+
+    update_voids_from_Mnc_and_von_neumann_enzyme(
+        phase=phase,
+        Mn_field=Mn_field,
+        Nk=Nk,
+        deg_origin=deg_origin,
+        mass_field=mass_field,
+        Mnc=Mnc,
+        E_field=E_field,
+        k_det=k_det,
+        rng=rng,
+        dt=dt
+    )
+
+    E_field[0, :] = E_BATH
+    E_field[-1, :] = E_BATH
+    E_field[:, 0] = E_BATH
+    E_field[:, -1] = E_BATH
+
+    O_field[0, :] = O_BATH
+    O_field[-1, :] = O_BATH
+    O_field[:, 0] = O_BATH
+    O_field[:, -1] = O_BATH
+
+    np.clip(E_field, 0.0, None, out=E_field)
+    np.clip(O_field, 0.0, None, out=O_field)
+
+
+# ============================================================
+# 7) HYBRID CA/PDE SIMULATION DRIVER FOR ONE POLYMER
+# ============================================================
+def run_hybrid_one_polymer(
+    params_kinetic,
+    D_E_intact,
+    D_E_void_ratio,
+    D_O_poly,
+    D_O_void_ratio,
+    MW0,
+    chi,
+    t_end,
+    seed,
+    record_times=None
+):
+    rng = np.random.default_rng(seed)
+
+    ny, nx = ROWS, COLS
+
+    N0_REPEAT = int(round(MW0 / M0_REPEAT))
+    M_MAX = N0_REPEAT
+
+    phase = rng.choice(
+        [S_AMORPH, S_CRYST],
+        size=(ny, nx),
+        p=[1.0 - chi, chi]
+    ).astype(int)
+
+    bound = np.zeros((ny, nx), dtype=bool)
+    deg_origin = np.full((ny, nx), ORIGIN_NONE, dtype=int)
+
+    Nk = np.zeros((ny, nx, M_MAX + 1), dtype=np.int16)
+    Nk[:, :, N0_REPEAT] = 1
+
+    Mn_field = MW0 * np.ones((ny, nx), dtype=float)
+    mass_field = np.ones((ny, nx), dtype=float)
+    O_field = np.zeros((ny, nx), dtype=float)
+
+    E_field = np.zeros((ny, nx), dtype=float)
+    E_field[0, :] = E_BATH
+    E_field[-1, :] = E_BATH
+    E_field[:, 0] = E_BATH
+    E_field[:, -1] = E_BATH
+
+    if record_times is None:
+        record_times = np.linspace(0, t_end, 51)
+
+    record_times = np.asarray(record_times, dtype=float)
+
+    t_record = []
+    wl_record = []
+    xc_record = []
+    mn_record = []
+    olig_record = []
+
+    def metrics():
+        """
+        Mass-consistent observables for the bulk CA/PDE model.
+
+        Interpretation:
+        - mass_field is the remaining non-soluble polymer mass in each cell.
+        - O_field is soluble/degraded oligomer mass still inside the film.
+        - Oligomer that diffuses out through the boundary is no longer in O_field
+          and therefore contributes to weight loss.
+        - Crystallinity is computed using remaining polymer mass, not cell counts:
+              Xc = crystalline mass / total polymer mass still inside film.
+        """
+
+        N_total = ny * nx
+
+        massC = np.sum(mass_field[phase == S_CRYST])
+        massA = np.sum(mass_field[phase == S_AMORPH])
+        massD = np.sum(mass_field[phase == S_DEG])
+        massO_inside = np.sum(O_field)
+
+        total_remaining_mass = massC + massA + massD + massO_inside
+
+        wl = 1.0 - total_remaining_mass / float(N_total)
+        wl = float(np.clip(wl, 0.0, 1.0))
+
+        xc = massC / total_remaining_mass if total_remaining_mass > 0 else 0.0
+
+        mn_global = recalc_Mn_from_Nk_cell(np.sum(Nk, axis=(0, 1)))
+        olig_inside = massO_inside / float(N_total)
+
+        return wl, xc, mn_global, olig_inside
+
+    t = 0.0
+
+    wl0, xc0, mn0, olig0 = metrics()
+
+    t_record.append(0.0)
+    wl_record.append(wl0)
+    xc_record.append(xc0)
+    mn_record.append(mn0)
+    olig_record.append(olig0)
+
+    next_record_idx = 1
+
+    while t < t_end - 1e-12:
+        E_field = diffuse_E(
+            E_field,
+            phase,
+            D_E_intact,
+            D_E_void_ratio,
+            DT,
+            DX
+        )
+
+        O_field = diffuse_oligomer(
+            O_field,
+            phase,
+            D_O_poly,
+            D_O_void_ratio,
+            DT,
+            DX
+        )
+
+        reaction_step(
+            phase=phase,
+            bound=bound,
+            E_field=E_field,
+            O_field=O_field,
+            Mn_field=Mn_field,
+            mass_field=mass_field,
+            Nk=Nk,
+            deg_origin=deg_origin,
+            params=params_kinetic,
+            rng=rng,
+            dt=DT,
+            N0_REPEAT=N0_REPEAT
+        )
+
+        t += DT
+
+        while (
+            next_record_idx < len(record_times)
+            and record_times[next_record_idx] <= t + 1e-12
+        ):
+            wl, xc, mn_global, olig_inside = metrics()
+
+            t_record.append(record_times[next_record_idx])
+            wl_record.append(wl)
+            xc_record.append(xc)
+            mn_record.append(mn_global)
+            olig_record.append(olig_inside)
+
+            next_record_idx += 1
+
+    return (
+        np.array(t_record),
+        np.array(wl_record),
+        np.array(xc_record),
+        np.array(mn_record),
+        np.array(olig_record)
+    )
+
+
+# ============================================================
+# 8) PARAMETER UNPACKING + ONE-POLYMER SIMULATION
+# ============================================================
+def unpack_theta(theta):
+    theta = np.asarray(theta, dtype=float)
+
+    params_kinetic = tuple(theta[:7])
+
+    D_E_intact = float(theta[7])
+    D_E_void_ratio = float(theta[8])
+    D_O_poly = float(theta[9])
+    D_O_void_ratio = float(theta[10])
+
+    return (
+        params_kinetic,
+        D_E_intact,
+        D_E_void_ratio,
+        D_O_poly,
+        D_O_void_ratio
+    )
+
+
+def simulate_polymer_predictions(poly_name, theta, seeds=SEEDS, record_times=None):
+    data = POLYMER_DATA[poly_name]
+
+    (
+        params_kinetic,
+        D_E_intact,
+        D_E_void_ratio,
+        D_O_poly,
+        D_O_void_ratio
+    ) = unpack_theta(theta)
+
+    if record_times is None:
+        record_times = np.unique(
+            np.concatenate([data["t_wl"], data["t_xc"]])
+        )
+
+    t_end = float(np.max(record_times))
+
+    wl_runs = []
+    xc_runs = []
+
+    for sd in seeds:
+        t_sim, wl_sim, xc_sim, _, _ = run_hybrid_one_polymer(
+            params_kinetic=params_kinetic,
+            D_E_intact=D_E_intact,
+            D_E_void_ratio=D_E_void_ratio,
+            D_O_poly=D_O_poly,
+            D_O_void_ratio=D_O_void_ratio,
+            MW0=data["MN0"],
+            chi=data["X_FIXED"],
+            t_end=t_end,
+            seed=int(sd),
+            record_times=record_times
+        )
+
+        wl_runs.append(np.interp(data["t_wl"], t_sim, wl_sim))
+        xc_runs.append(np.interp(data["t_xc"], t_sim, xc_sim))
+
+    return {
+        "wl": np.mean(np.asarray(wl_runs), axis=0),
+        "xc": np.mean(np.asarray(xc_runs), axis=0),
+    }
+
+
+# ============================================================
+# 9) NORMAL JOINT LEAST-SQUARES COST FOR ONE GRADE
+# ============================================================
+def joint_ls_cost(theta):
+    theta = np.asarray(theta, dtype=float)
+
+    if np.any(theta <= 0):
+        return 1e12
+
+    (
+        params_kinetic,
+        D_E_intact,
+        D_E_void_ratio,
+        D_O_poly,
+        D_O_void_ratio
+    ) = unpack_theta(theta)
+
+    k1, k3, k_conv, k_deg_C, k_deg_A, Mnc, k_det = params_kinetic
+
+    if k_deg_A <= k_deg_C:
+        return 1e12
+
+    if k3 <= k1:
+        return 1e12
+
+    if not (0.0 <= Mnc <= 25000.0):
+        return 1e12
+
+    if not (1.0 <= D_E_void_ratio <= 100.0):
+        return 1e12
+
+    if not (1.0 <= D_O_void_ratio <= 100.0):
+        return 1e12
+
+    residuals = []
+
+    try:
+        for poly_name, data in POLYMER_DATA.items():
+            pred = simulate_polymer_predictions(poly_name, theta)
+
+            # Ordinary unweighted residuals.
+            # No error bars.
+            # No sigma scaling.
+            # No weighted least squares.
+            residuals.extend(pred["wl"] - data["wl_obs"])
+            residuals.extend(pred["xc"] - data["xc_obs"])
+
+        residuals = np.asarray(residuals, dtype=float)
+
+        cost = np.sum(residuals**2)
+
+    except Exception:
+        return 1e12
+
+    if not np.isfinite(cost):
+        return 1e12
+
+    return float(cost)
+
+
+def pso_objective(swarm):
+    return np.array(
+        [joint_ls_cost(theta) for theta in swarm],
+        dtype=float
+    )
+
+
+# ============================================================
+# 10) PSO + SLSQP CALIBRATION
+# ============================================================
+def calibrate_pso_ls(n_particles=25, iters=15, local_refine=True):
+    lo = np.array([
+        1e-6,      # k1
+        1e-6,      # k3
+        1e-8,      # k_conv
+        1e-6,      # k_deg_C
+        1e-6,      # k_deg_A
+        1e-6,      # Mnc
+        1e-6,      # k_det
+        1e-4,      # D_E_intact
+        1.0,       # D_E_void_ratio
+        1e-6,      # D_O_poly
+        1.0,       # D_O_void_ratio
+    ])
+
+    hi = np.array([
+        2.0,       # k1
+        8.0,       # k3
+        1.0,       # k_conv
+        1.0,       # k_deg_C
+        3.0,       # k_deg_A
+        25000.0,   # Mnc
+        5.0,       # k_det
+        50.0,      # D_E_intact
+        5.0,       # D_E_void_ratio
+        50.0,      # D_O_poly
+        100.0,     # D_O_void_ratio
+    ])
+
+    np.random.seed(SEED)
+
+    optimizer = GlobalBestPSO(
+        n_particles=n_particles,
+        dimensions=11,
+        bounds=(lo, hi),
+        options={"c1": 1.7, "c2": 1.7, "w": 0.6}
+    )
+
+    best_cost, best_theta = optimizer.optimize(
+        pso_objective,
+        iters=iters,
+        verbose=True
+    )
+
+    theta_final = best_theta
+    final_cost = best_cost
+
+    if local_refine:
+        res = minimize(
+            joint_ls_cost,
+            best_theta,
+            method="SLSQP",
+            bounds=list(zip(lo, hi)),
+            options={
+                "maxiter": 120,
+                "ftol": 1e-8,
+                "disp": True
+            }
+        )
+
+        theta_final = res.x
+        final_cost = res.fun
+
+    names = [
+        "k1",
+        "k3",
+        "k_conv",
+        "k_deg_C",
+        "k_deg_A",
+        "Mnc",
+        "k_det",
+        "D_E_intact",
+        "D_E_void_ratio",
+        "D_O_poly",
+        "D_O_void_ratio"
+    ]
+
+    print("\n================ FINAL PARAMETERS ================")
+
+    for name, value in zip(names, theta_final):
+        if name == "Mnc":
+            print(f"{name:22s} = {value:.6e} g/mol")
+        else:
+            print(f"{name:22s} = {value:.6e}")
+
+    print(f"{'PHI_WINDOW':22s} = {PHI_WINDOW:d}")
+    print(f"{'M_SOL':22s} = {M_SOL:d}")
+    print(f"Final ordinary joint least-squares cost = {final_cost:.6e}")
+
+    return theta_final, final_cost
+
+
+# ============================================================
+# 11) FIT QUALITY
+# ============================================================
+def r2_score(y_true, y_pred):
+    y_true = np.asarray(y_true, float)
+    y_pred = np.asarray(y_pred, float)
+
+    ss_res = np.sum((y_true - y_pred)**2)
+    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+
+    return np.nan if ss_tot == 0 else 1.0 - ss_res / ss_tot
+
+
+# ============================================================
+# 12) MAIN
+# ============================================================
+if __name__ == "__main__":
+    print("\n================ MODEL SUMMARY ================")
+    print(f"One-polymer fit: {SELECTED_POLYMER}")
+    print("Objective: ordinary joint least squares using WL + Xc only")
+    print("No experimental error bars, no residual weights, and no sigma scaling are used.")
+    print("Boundary-contact erosion rule: boundary S_DEG cells are immediately eligible for probabilistic erosion.")
+    print("Interior S_DEG cells still require Mn_cell <= Mnc and enzyme in the von Neumann neighbourhood.")
+
+    theta_opt, final_cost = calibrate_pso_ls(
+        n_particles=25,
+        iters=15,
+        local_refine=True
+    )
+
+    names = [
+        "k1", "k3", "k_conv", "k_deg_C", "k_deg_A", "Mnc", "k_det",
+        "D_E_intact", "D_E_void_ratio", "D_O_poly", "D_O_void_ratio"
+    ]
+
+    data = POLYMER_DATA[SELECTED_POLYMER]
+    pred = simulate_polymer_predictions(SELECTED_POLYMER, theta_opt)
+
+    r2_wl = r2_score(data["wl_obs"], pred["wl"])
+    r2_xc = r2_score(data["xc_obs"], pred["xc"])
+
+    print(f"\n================ {SELECTED_POLYMER} FIT QUALITY ================")
+    print(f"R² WL = {r2_wl:.4f}")
+    print(f"R² Xc = {r2_xc:.4f}")
+    print(f"Final ordinary joint LS cost = {final_cost:.6e}")
+
+    # Unique run ID prevents PermissionError if an older Excel/figure file is open.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ============================================================
+    # SAVE CURVE DATA TO EXCEL
+    # ============================================================
+    excel_path = os.path.join(
+        OUTPUT_DIR,
+        f"{SELECTED_POLYMER}_normal_joint_LS_curve_data_{timestamp}.xlsx"
+    )
+
+    curve_df = pd.DataFrame({
+        "time_WL_h": data["t_wl"],
+        "WL_observed_percent": 100.0 * data["wl_obs"],
+        "WL_fitted_percent": 100.0 * pred["wl"],
+        "time_Xc_h": data["t_xc"],
+        "Xc_observed_percent": 100.0 * data["xc_obs"],
+        "Xc_fitted_percent": 100.0 * pred["xc"],
+    })
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        curve_df.to_excel(writer, sheet_name=SELECTED_POLYMER, index=False)
+
+    # ============================================================
+    # SEPARATE PLOTS, NO TITLES, 600 DPI
+    # ============================================================
+    # SEPARATE SMOOTH PLOTS, NO TITLES, 600 DPI
+    # ============================================================
+    t_smooth = np.linspace(
+        min(data["t_wl"].min(), data["t_xc"].min()),
+        max(data["t_wl"].max(), data["t_xc"].max()),
+        300
+    )
+
+    wl_smooth = PchipInterpolator(
+        data["t_wl"],
+        100.0 * pred["wl"]
+    )(t_smooth)
+
+    xc_smooth = PchipInterpolator(
+        data["t_xc"],
+        100.0 * pred["xc"]
+    )(t_smooth)
+
+    # -----------------------------
+    # Weight loss plot
+    # -----------------------------
+    fig_wl, ax = plt.subplots(figsize=(8, 5.5))
+
+    ax.plot(
+        data["t_wl"],
+        100.0 * data["wl_obs"],
+        "ko",
+        ms=10,
+        label=f"{SELECTED_POLYMER}-CALB data"
+    )
+
+    ax.plot(
+        t_smooth,
+        wl_smooth,
+        "r-",
+        lw=5,
+        label="CA model fit"
+    )
+
+    ax.set_xlabel("Time (h)", fontsize=18)
+    ax.set_ylabel("Weight loss (%)", fontsize=18)
+    ax.tick_params(axis="both", labelsize=16)
+
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=14, frameon=True)
+
+    plt.tight_layout()
+
+    wl_fig_name = os.path.join(
+        OUTPUT_DIR,
+        f"{SELECTED_POLYMER}_normal_joint_LS_weight_loss_smooth_no_title_{timestamp}.png"
+    )
+
+    plt.savefig(wl_fig_name, dpi=600, bbox_inches="tight")
+    plt.show()
+
+    # -----------------------------
+    # Crystallinity plot
+    # -----------------------------
+    fig_xc, ax = plt.subplots(figsize=(8, 5.5))
+
+    ax.plot(
+        data["t_xc"],
+        100.0 * data["xc_obs"],
+        "ks",
+        ms=10,
+        label=f"{SELECTED_POLYMER}-CALB data"
+    )
+
+    ax.plot(
+        t_smooth,
+        xc_smooth,
+        "b-",
+        lw=5,
+        label="CA model fit"
+    )
+
+    ax.set_xlabel("Time (h)", fontsize=18)
+    ax.set_ylabel("Remaining crystallinity (%)", fontsize=18)
+    ax.tick_params(axis="both", labelsize=16)
+
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=14, frameon=True)
+
+    plt.tight_layout()
+
+    xc_fig_name = os.path.join(
+        OUTPUT_DIR,
+        f"{SELECTED_POLYMER}_normal_joint_LS_crystallinity_smooth_no_title_{timestamp}.png"
+    )
+
+    plt.savefig(xc_fig_name, dpi=600, bbox_inches="tight")
+    plt.show()
+
+    # ============================================================
+    # SAVE PARAMETER AND FIT SUMMARY
+    # ============================================================
+    param_name = os.path.join(
+        OUTPUT_DIR,
+        f"{SELECTED_POLYMER}_normal_joint_LS_parameters_{timestamp}.tsv"
+    )
+
+    with open(param_name, "w") as f:
+        f.write("parameter\tvalue\n")
+
+        for nm, val in zip(names, theta_opt):
+            f.write(f"{nm}\t{val:.6e}\n")
+
+        f.write(f"SELECTED_POLYMER\t{SELECTED_POLYMER}\n")
+        f.write(f"MN0\t{data['MN0']:.6e}\n")
+        f.write(f"X_FIXED\t{data['X_FIXED']:.6e}\n")
+        f.write(f"PHI_WINDOW\t{PHI_WINDOW:d}\n")
+        f.write(f"M_SOL\t{M_SOL:d}\n")
+        f.write(f"ROWS\t{ROWS:d}\n")
+        f.write(f"COLS\t{COLS:d}\n")
+        f.write(f"DX\t{DX:.6e}\n")
+        f.write(f"L_Y\t{L_Y:.6e}\n")
+        f.write(f"L_X\t{L_X:.6e}\n")
+        f.write("USE_MW_IN_OBJECTIVE\t0\n")
+        f.write("OBJECTIVE\tordinary_unweighted_joint_least_squares\n")
+        f.write("erosion_rule\tboundary_S_DEG_immediately_eligible_probabilistic_erosion_interior_S_DEG_requires_Mn_less_equal_Mnc_and_von_Neumann_enzyme\n")
+        f.write(f"Final_joint_LS_cost\t{final_cost:.6e}\n")
+        f.write(f"R2_WL\t{r2_wl:.6e}\n")
+        f.write(f"R2_Xc\t{r2_xc:.6e}\n")
+
+    fit_name = os.path.join(
+        OUTPUT_DIR,
+        f"{SELECTED_POLYMER}_normal_joint_LS_R2_summary_{timestamp}.tsv"
+    )
+
+    with open(fit_name, "w") as f:
+        f.write("polymer\tmetric\tR2\n")
+        f.write(f"{SELECTED_POLYMER}\tWL\t{r2_wl:.6e}\n")
+        f.write(f"{SELECTED_POLYMER}\tXc\t{r2_xc:.6e}\n")
+
+    print(f"\nSaved WL figure: {wl_fig_name}")
+    print(f"Saved Xc figure: {xc_fig_name}")
+    print(f"Saved Excel curve data: {excel_path}")
+    print(f"Saved parameter summary: {param_name}")
+    print(f"Saved R² summary: {fit_name}")
+    print("\nDone.")
