@@ -1,4 +1,4 @@
-function [Si_WL, Ti_WL, Si_Xc, Ti_Xc] = CA_Sobol_PCL6500()
+function [Si_WL, Ti_WL] = CA_Sobol_PCL6500()
 
 rng(123);
 stamp = datestr(now,'yyyymmdd_HHMMSS');
@@ -7,7 +7,7 @@ outdir = fullfile(downloads_dir, ['CA_Sobol_PCL6500_' stamp]);
 if ~exist(outdir,'dir'), mkdir(outdir); end
 
 % -------------------- USER SETTINGS --------------------
-% Increase SAMPLE_POINTS if can afford computational cost.
+% Increase SAMPLE_POINTS to 256 or 512 for production-grade indices.
 TARGET_ROWS   = 10;       % 10 gives 10 x 333 grid for PCL6500
 SAMPLE_POINTS = 256;      % Saltelli base sample size, M
 N_REP         = 1;        % CA seed is reset deterministically per call
@@ -61,44 +61,31 @@ Nt = numel(time_points);
 
 Si_WL_raw = out.Si(1:Nt,:);
 Ti_WL_raw = out.Ti(1:Nt,:);
-Si_Xc_raw = out.Si(Nt+1:2*Nt,:);
-Ti_Xc_raw = out.Ti(Nt+1:2*Nt,:);
 
 Si_WL = max(min(Si_WL_raw, 1), 0);
 Ti_WL = max(min(Ti_WL_raw, 1), 0);
-Si_Xc = max(min(Si_Xc_raw, 1), 0);
-Ti_Xc = max(min(Ti_Xc_raw, 1), 0);
 
 % -------------------- save --------------------
 writematrix(time_points(:), fullfile(outdir, 'sobol_time_points_hours.csv'));
 writematrix(Si_WL_raw, fullfile(outdir, 'sobol_Si_weight_loss_raw.csv'));
 writematrix(Ti_WL_raw, fullfile(outdir, 'sobol_Ti_weight_loss_raw.csv'));
-writematrix(Si_Xc_raw, fullfile(outdir, 'sobol_Si_crystallinity_raw.csv'));
-writematrix(Ti_Xc_raw, fullfile(outdir, 'sobol_Ti_crystallinity_raw.csv'));
 writematrix(Si_WL, fullfile(outdir, 'sobol_Si_weight_loss_clipped.csv'));
 writematrix(Ti_WL, fullfile(outdir, 'sobol_Ti_weight_loss_clipped.csv'));
-writematrix(Si_Xc, fullfile(outdir, 'sobol_Si_crystallinity_clipped.csv'));
-writematrix(Ti_Xc, fullfile(outdir, 'sobol_Ti_crystallinity_clipped.csv'));
 
 excel_file = fullfile(outdir, 'CA_sobol_indices_PCL6500.xlsx');
 varnames = [{'Time_hours'}, short_names];
 
 writetable(array2table([time_points(:), Si_WL_raw], 'VariableNames', varnames), excel_file, 'Sheet', 'Si_WL_raw');
 writetable(array2table([time_points(:), Ti_WL_raw], 'VariableNames', varnames), excel_file, 'Sheet', 'Ti_WL_raw');
-writetable(array2table([time_points(:), Si_Xc_raw], 'VariableNames', varnames), excel_file, 'Sheet', 'Si_Xc_raw');
-writetable(array2table([time_points(:), Ti_Xc_raw], 'VariableNames', varnames), excel_file, 'Sheet', 'Ti_Xc_raw');
 writetable(array2table([time_points(:), Si_WL], 'VariableNames', varnames), excel_file, 'Sheet', 'Si_WL_clipped');
 writetable(array2table([time_points(:), Ti_WL], 'VariableNames', varnames), excel_file, 'Sheet', 'Ti_WL_clipped');
-writetable(array2table([time_points(:), Si_Xc], 'VariableNames', varnames), excel_file, 'Sheet', 'Si_Xc_clipped');
-writetable(array2table([time_points(:), Ti_Xc], 'VariableNames', varnames), excel_file, 'Sheet', 'Ti_Xc_clipped');
 
 writetable(table(lb(:), ub(:), 'VariableNames', {'lb','ub'}, 'RowNames', short_names(:)), excel_file, 'Sheet', 'bounds', 'WriteRowNames', true);
 
 markers = {'o','s','d','^','v','>','<','p','h','x','+'};
+% Weight-loss plots only. Crystallinity Sobol plots are intentionally not generated.
 plot_sobol_curves(time_points, Si_WL, param_names, markers, 'First-order Sobol index', 'Weight loss', fullfile(outdir, 'sobol_first_order_weight_loss.png'), EXPORT_DPI);
 plot_sobol_curves(time_points, Ti_WL, param_names, markers, 'Total-order Sobol index', 'Weight loss', fullfile(outdir, 'sobol_total_order_weight_loss.png'), EXPORT_DPI);
-plot_sobol_curves(time_points, Si_Xc, param_names, markers, 'First-order Sobol index', 'Crystallinity', fullfile(outdir, 'sobol_first_order_crystallinity.png'), EXPORT_DPI);
-plot_sobol_curves(time_points, Ti_Xc, param_names, markers, 'Total-order Sobol index', 'Crystallinity', fullfile(outdir, 'sobol_total_order_crystallinity.png'), EXPORT_DPI);
 
 fprintf('\nSaved Sobol outputs to:\n%s\n', outdir);
 end
@@ -114,9 +101,10 @@ WL = nan(C.N_REP, numel(time_points));
 Xc = nan(C.N_REP, numel(time_points));
 for r = 1:C.N_REP
     [~, wl, xc] = run_CA_series(theta, time_points, C, C.SEED_BASE + r);
-    WL(r,:) = wl(:)'; Xc(r,:) = xc(:)';
+    WL(r,:) = wl(:)'; Xc(r,:) = xc(:)'; %#ok<NASGU>
 end
-y = [mean(WL,1,'omitnan'), mean(Xc,1,'omitnan')];
+% Sobol outputs are restricted to weight loss only.
+y = mean(WL,1,'omitnan');
 end
 
 % =====================================================================
