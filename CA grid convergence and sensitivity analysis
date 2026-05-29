@@ -1,0 +1,1171 @@
+# ============================================================
+# HYBRID CA/PDE GRID SENSITIVITY AND CONVERGENCE
+# Fixed PCL6500 parameters, no calibration, no data points
+# ============================================================
+
+import os
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import spsolve
+from matplotlib.ticker import MaxNLocator
+from mpl_toolkits.mplot3d import Axes3D
+
+
+# ============================================================
+# OUTPUT FOLDER
+# ============================================================
+DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+OUTPUT_DIR = os.path.join(
+    DOWNLOADS_DIR,
+    "PCL6500_Grid_Sensitivity_Convergence_Fixed_Params"
+)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+print(f"Results will be saved in:\n{OUTPUT_DIR}")
+
+
+# ============================================================
+# FIXED PCL6500 DATA SETTINGS
+# ============================================================
+SELECTED_POLYMER = "PCL6500"
+
+MN0 = 32944.57
+X_FIXED = 0.60
+T_END = 20.0
+
+# Only used for optional RMSE against finest-grid reference,
+# not experimental data.
+RECORD_TIMES = np.linspace(0.0, T_END, 201)
+
+
+# ============================================================
+# FIXED CALIBRATED PARAMETERS
+# ============================================================
+k1 = 0.50
+k3 = 6.1
+k_conv = 0.19
+k_deg_C = 0.31
+k_deg_A = 2.4
+Mnc = 7900.0
+k_det = 4.3
+D_E_intact = 21.0
+D_E_void_ratio = 2.5
+D_O_poly = 25.0
+D_O_void_ratio = 45.0
+
+PARAMS_KINETIC = (
+    k1, k3, k_conv, k_deg_C, k_deg_A, Mnc, k_det
+)
+
+
+# ============================================================
+# MODEL CONSTANTS
+# ============================================================
+BASE_ROWS = 10
+BASE_COLS = 333
+BASE_DX = 1.0
+
+L_Y = BASE_ROWS * BASE_DX
+L_X = BASE_COLS * BASE_DX
+
+DT = 0.05
+
+S_CRYST = 1
+S_AMORPH = 0
+S_DEG = 2
+S_VOID = -1
+
+ORIGIN_NONE = 0
+ORIGIN_C = 1
+ORIGIN_A = 2
+
+E_BATH = 1.0
+O_BATH = 0.0
+
+PHI_WINDOW = 1
+M_SOL = 8
+M0_REPEAT = 114.14
+
+SEED = 42
+N_REP = 1
+SEEDS = [SEED + i for i in range(N_REP)]
+
+ENZYME_NEIGHBOUR_THRESHOLD = 1e-12
+
+GRID_SIZES = [
+    (10, 333),
+    (20, 666),
+    (30, 999),
+    (40, 1332),
+    (50, 1665),
+    (60, 1998),
+    (80, 2664),
+    (100, 3330),
+    (120, 3996),
+    (150, 4995),
+]
+
+
+# ============================================================
+# POROSITY AND DIFFUSIVITY
+# ============================================================
+def compute_porosity_field(phase, window):
+    void_only = (phase == S_VOID).astype(float)
+    ny, nx = phase.shape
+    phi = np.zeros_like(void_only, dtype=float)
+
+    pad = max(int(window), 1)
+    padded_void = np.pad(
+        void_only,
+        pad_width=pad,
+        mode="constant",
+        constant_values=1.0
+    )
+
+    w = 2 * pad + 1
+
+    for dj in range(-pad, pad + 1):
+        for di in range(-pad, pad + 1):
+            phi += padded_void[
+                pad + dj:pad + dj + ny,
+                pad + di:pad + di + nx
+            ]
+
+    phi /= float(w * w)
+    return phi
+
+
+def effective_diffusivity(phi, D_intact, D_void_ratio):
+    return D_intact * (1.0 + (D_void_ratio - 1.0) * phi)
+
+
+# ============================================================
+# DIFFUSION
+# ============================================================
+def build_diffusion_matrix(D_field, dt, dx, bath_value):
+    ny, nx = D_field.shape
+    n_solve_rows = ny - 2
+    n_solve_cols = nx - 2
+
+    if n_solve_rows <= 0 or n_solve_cols <= 0:
+        raise ValueError("ROWS and COLS must both be at least 3.")
+
+    N = n_solve_rows * n_solve_cols
+
+    def idx(j, i):
+        return (j - 1) * n_solve_cols + (i - 1)
+
+    rows, cols, vals = [], [], []
+    rhs_extra = np.zeros(N)
+
+    for j in range(1, ny - 1):
+        for i in range(1, nx - 1):
+            k = idx(j, i)
+            diag_val = 1.0
+
+            for dj, di in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                jj, ii = j + dj, i + di
+
+                D_face = 0.5 * (D_field[j, i] + D_field[jj, ii])
+                coef = dt * D_face / dx**2
+
+                if jj == 0 or jj == ny - 1 or ii == 0 or ii == nx - 1:
+                    rhs_extra[k] += coef * bath_value
+                else:
+                    rows.append(k)
+                    cols.append(idx(jj, ii))
+                    vals.append(-coef)
+
+                diag_val += coef
+
+            rows.append(k)
+            cols.append(k)
+            vals.append(diag_val)
+
+    A = csr_matrix((vals, (rows, cols)), shape=(N, N))
+    return A, rhs_extra
+
+
+def diffuse_field(field, phase, D_intact, D_void_ratio, dt, dx, bath_value):
+    ny, nx = field.shape
+
+    phi = compute_porosity_field(phase, window=PHI_WINDOW)
+    D_field = effective_diffusivity(phi, D_intact, D_void_ratio)
+
+    A, rhs_extra = build_diffusion_matrix(D_field, dt, dx, bath_value)
+
+    rhs = field[1:-1, 1:-1].flatten() + rhs_extra
+    internal_new = spsolve(A, rhs).reshape(ny - 2, nx - 2)
+
+    out = field.copy()
+    out[0, :] = bath_value
+    out[-1, :] = bath_value
+    out[:, 0] = bath_value
+    out[:, -1] = bath_value
+    out[1:-1, 1:-1] = internal_new
+
+    np.clip(out, 0.0, None, out=out)
+    return out
+
+
+def diffuse_E(E_field, phase, dt, dx):
+    return diffuse_field(
+        E_field,
+        phase,
+        D_E_intact,
+        D_E_void_ratio,
+        dt,
+        dx,
+        E_BATH
+    )
+
+
+def diffuse_oligomer(O_field, phase, dt, dx):
+    return diffuse_field(
+        O_field,
+        phase,
+        D_O_poly,
+        D_O_void_ratio,
+        dt,
+        dx,
+        O_BATH
+    )
+
+
+# ============================================================
+# MOLECULAR WEIGHT AND CHAIN TRACKING
+# ============================================================
+def recalc_Mn_from_Nk_cell(Nk_cell):
+    k_vals = np.arange(Nk_cell.size, dtype=float)
+    total_units = np.sum(k_vals * Nk_cell)
+    total_chains = np.sum(Nk_cell)
+
+    if total_chains <= 0 or total_units <= 0:
+        return 0.0
+
+    return M0_REPEAT * total_units / total_chains
+
+
+def perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng):
+    Nk_cell = Nk[j, i, :]
+
+    available = np.where(Nk_cell > 0)[0]
+    available = available[available >= 2]
+
+    if available.size == 0:
+        return False
+
+    weights = Nk_cell[available].astype(float)
+    weights /= np.sum(weights)
+
+    k_old = int(rng.choice(available, p=weights))
+    r = int(rng.integers(1, k_old))
+
+    Nk[j, i, k_old] -= 1
+    Nk[j, i, r] += 1
+    Nk[j, i, k_old - r] += 1
+
+    Mn_field[j, i] = recalc_Mn_from_Nk_cell(Nk[j, i, :])
+    return True
+
+
+def move_m8_oligomers_to_PDE(
+    Nk,
+    Mn_field,
+    mass_field,
+    O_field,
+    j,
+    i,
+    N0_REPEAT,
+    m_sol=M_SOL
+):
+    m = int(max(1, min(m_sol, Nk.shape[2] - 1)))
+
+    small_counts = Nk[j, i, 1:m + 1].astype(float)
+
+    if np.sum(small_counts) <= 0:
+        return 0.0
+
+    k_vals = np.arange(1, m + 1, dtype=float)
+    soluble_units = float(np.sum(k_vals * small_counts))
+
+    if soluble_units <= 0.0:
+        return 0.0
+
+    soluble_fraction = soluble_units / float(N0_REPEAT)
+
+    mass_field[j, i] = max(0.0, mass_field[j, i] - soluble_fraction)
+    O_field[j, i] += soluble_fraction
+
+    Nk[j, i, 1:m + 1] = 0
+    Mn_field[j, i] = recalc_Mn_from_Nk_cell(Nk[j, i, :])
+
+    return soluble_fraction
+
+
+# ============================================================
+# EROSION RULE
+# ============================================================
+def von_neumann_enzyme_sum(E_field):
+    Esum = np.zeros_like(E_field, dtype=float)
+
+    Esum[1:, :] += E_field[:-1, :]
+    Esum[:-1, :] += E_field[1:, :]
+    Esum[:, 1:] += E_field[:, :-1]
+    Esum[:, :-1] += E_field[:, 1:]
+
+    Esum[0, :] += E_BATH
+    Esum[-1, :] += E_BATH
+    Esum[:, 0] += E_BATH
+    Esum[:, -1] += E_BATH
+
+    return Esum
+
+
+def boundary_contact_mask(shape):
+    ny, nx = shape
+    mask = np.zeros((ny, nx), dtype=bool)
+    mask[0, :] = True
+    mask[-1, :] = True
+    mask[:, 0] = True
+    mask[:, -1] = True
+    return mask
+
+
+def update_voids_from_Mnc_and_von_neumann_enzyme(
+    phase,
+    Mn_field,
+    Nk,
+    deg_origin,
+    mass_field,
+    Mnc,
+    E_field,
+    k_det,
+    rng,
+    dt
+):
+    E_neigh_sum = von_neumann_enzyme_sum(E_field)
+    has_E_neigh = E_neigh_sum > ENZYME_NEIGHBOUR_THRESHOLD
+
+    boundary_contact = boundary_contact_mask(phase.shape)
+
+    eligible = (
+        (phase == S_DEG)
+        &
+        (
+            boundary_contact
+            | (Mn_field <= Mnc)
+        )
+        &
+        has_E_neigh
+    )
+
+    E_neigh_mean = E_neigh_sum / 4.0
+    P_void = 1.0 - np.exp(-k_det * E_neigh_mean * dt)
+    P_void = np.clip(P_void, 0.0, 1.0)
+
+    erode = eligible & (rng.random(phase.shape) < P_void)
+
+    phase[erode] = S_VOID
+    Mn_field[erode] = 0.0
+    mass_field[erode] = 0.0
+    Nk[erode, :] = 0
+    deg_origin[erode] = ORIGIN_NONE
+
+
+# ============================================================
+# CA REACTION STEP
+# ============================================================
+def reaction_step(
+    phase,
+    bound,
+    E_field,
+    O_field,
+    Mn_field,
+    mass_field,
+    Nk,
+    deg_origin,
+    rng,
+    dt,
+    N0_REPEAT
+):
+    k1, k3, k_conv, k_deg_C, k_deg_A, Mnc, k_det = PARAMS_KINETIC
+
+    ny, nx = phase.shape
+
+    phase_old = phase.copy()
+    bound_old = bound.copy()
+    E_old = E_field.copy()
+    origin_old = deg_origin.copy()
+
+    dE_quantum = E_BATH / max(ny * nx // 100, 1)
+
+    U1 = rng.random((ny, nx))
+    U2 = rng.random((ny, nx))
+
+    for j in range(ny):
+        for i in range(nx):
+            s = phase_old[j, i]
+            b = bound_old[j, i]
+            E_loc = E_old[j, i]
+
+            if s == S_VOID:
+                continue
+
+            u1 = U1[j, i]
+            u2 = U2[j, i]
+
+            if s == S_DEG:
+                origin = origin_old[j, i]
+
+                if origin == ORIGIN_C:
+                    rate = k_deg_C * E_loc
+                elif origin == ORIGIN_A:
+                    rate = k_deg_A * E_loc
+                else:
+                    rate = 0.0
+
+                P = 1.0 - np.exp(-rate * dt)
+
+                if u1 < P:
+                    perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng)
+
+                move_m8_oligomers_to_PDE(
+                    Nk,
+                    Mn_field,
+                    mass_field,
+                    O_field,
+                    j,
+                    i,
+                    N0_REPEAT
+                )
+
+                continue
+
+            if s == S_CRYST:
+                if not b:
+                    rate = k1 * E_loc
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P and E_loc > dE_quantum:
+                        bound[j, i] = True
+                        E_field[j, i] -= dE_quantum
+
+                else:
+                    rates = np.array([k_conv, k_deg_C], dtype=float)
+                    r_tot = np.sum(rates)
+
+                    if r_tot > 0:
+                        P = 1.0 - np.exp(-r_tot * dt)
+
+                        if u1 < P:
+                            cum = np.cumsum(rates) / r_tot
+
+                            if u2 < cum[0]:
+                                phase[j, i] = S_AMORPH
+                            else:
+                                phase[j, i] = S_DEG
+                                deg_origin[j, i] = ORIGIN_C
+
+                                perform_chain_scission_full_Nk(
+                                    Nk,
+                                    Mn_field,
+                                    j,
+                                    i,
+                                    rng
+                                )
+
+                                move_m8_oligomers_to_PDE(
+                                    Nk,
+                                    Mn_field,
+                                    mass_field,
+                                    O_field,
+                                    j,
+                                    i,
+                                    N0_REPEAT
+                                )
+
+                            bound[j, i] = False
+                            E_field[j, i] += dE_quantum
+
+                continue
+
+            if s == S_AMORPH:
+                if not b:
+                    rate = k3 * E_loc
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P and E_loc > dE_quantum:
+                        bound[j, i] = True
+                        E_field[j, i] -= dE_quantum
+
+                else:
+                    rate = k_deg_A
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P:
+                        phase[j, i] = S_DEG
+                        deg_origin[j, i] = ORIGIN_A
+
+                        perform_chain_scission_full_Nk(
+                            Nk,
+                            Mn_field,
+                            j,
+                            i,
+                            rng
+                        )
+
+                        move_m8_oligomers_to_PDE(
+                            Nk,
+                            Mn_field,
+                            mass_field,
+                            O_field,
+                            j,
+                            i,
+                            N0_REPEAT
+                        )
+
+                        bound[j, i] = False
+                        E_field[j, i] += dE_quantum
+
+                continue
+
+    update_voids_from_Mnc_and_von_neumann_enzyme(
+        phase=phase,
+        Mn_field=Mn_field,
+        Nk=Nk,
+        deg_origin=deg_origin,
+        mass_field=mass_field,
+        Mnc=Mnc,
+        E_field=E_field,
+        k_det=k_det,
+        rng=rng,
+        dt=dt
+    )
+
+    E_field[0, :] = E_BATH
+    E_field[-1, :] = E_BATH
+    E_field[:, 0] = E_BATH
+    E_field[:, -1] = E_BATH
+
+    O_field[0, :] = O_BATH
+    O_field[-1, :] = O_BATH
+    O_field[:, 0] = O_BATH
+    O_field[:, -1] = O_BATH
+
+    np.clip(E_field, 0.0, None, out=E_field)
+    np.clip(O_field, 0.0, None, out=O_field)
+
+
+# ============================================================
+# SIMULATION DRIVER
+# ============================================================
+def run_hybrid_one_grid(rows, cols, dx, seed, record_times):
+    rng = np.random.default_rng(seed)
+
+    ny, nx = rows, cols
+
+    N0_REPEAT = int(round(MN0 / M0_REPEAT))
+    M_MAX = N0_REPEAT
+
+    phase = rng.choice(
+        [S_AMORPH, S_CRYST],
+        size=(ny, nx),
+        p=[1.0 - X_FIXED, X_FIXED]
+    ).astype(int)
+
+    bound = np.zeros((ny, nx), dtype=bool)
+    deg_origin = np.full((ny, nx), ORIGIN_NONE, dtype=int)
+
+    Nk = np.zeros((ny, nx, M_MAX + 1), dtype=np.int16)
+    Nk[:, :, N0_REPEAT] = 1
+
+    Mn_field = MN0 * np.ones((ny, nx), dtype=float)
+    mass_field = np.ones((ny, nx), dtype=float)
+    O_field = np.zeros((ny, nx), dtype=float)
+
+    E_field = np.zeros((ny, nx), dtype=float)
+    E_field[0, :] = E_BATH
+    E_field[-1, :] = E_BATH
+    E_field[:, 0] = E_BATH
+    E_field[:, -1] = E_BATH
+
+    record_times = np.asarray(record_times, dtype=float)
+
+    t_record = []
+    wl_record = []
+    xc_record = []
+
+    def metrics():
+
+
+        N_total = ny * nx
+
+        massC = np.sum(mass_field[phase == S_CRYST])
+        massA = np.sum(mass_field[phase == S_AMORPH])
+        massD = np.sum(mass_field[phase == S_DEG])
+        massO_inside = np.sum(O_field)
+
+        total_remaining_mass = massC + massA + massD + massO_inside
+
+        wl = 1.0 - total_remaining_mass / float(N_total)
+        wl = float(np.clip(wl, 0.0, 1.0))
+
+        xc = massC / total_remaining_mass if total_remaining_mass > 0 else 0.0
+
+        return wl, xc
+
+    t = 0.0
+    wl0, xc0 = metrics()
+
+    t_record.append(0.0)
+    wl_record.append(wl0)
+    xc_record.append(xc0)
+
+    next_record_idx = 1
+
+    while t < T_END - 1e-12:
+        E_field = diffuse_E(E_field, phase, DT, dx)
+        O_field = diffuse_oligomer(O_field, phase, DT, dx)
+
+        reaction_step(
+            phase=phase,
+            bound=bound,
+            E_field=E_field,
+            O_field=O_field,
+            Mn_field=Mn_field,
+            mass_field=mass_field,
+            Nk=Nk,
+            deg_origin=deg_origin,
+            rng=rng,
+            dt=DT,
+            N0_REPEAT=N0_REPEAT
+        )
+
+        t += DT
+
+        while (
+            next_record_idx < len(record_times)
+            and record_times[next_record_idx] <= t + 1e-12
+        ):
+            wl, xc = metrics()
+
+            t_record.append(record_times[next_record_idx])
+            wl_record.append(wl)
+            xc_record.append(xc)
+
+            next_record_idx += 1
+
+    return np.array(t_record), np.array(wl_record), np.array(xc_record)
+
+
+# ============================================================
+# RUN GRID SENSITIVITY
+# ============================================================
+all_curves = {}
+summary_rows = []
+
+print("\n================ GRID SENSITIVITY RUN ================")
+
+for rows, cols in GRID_SIZES:
+    dx_y = L_Y / rows
+    dx_x = L_X / cols
+
+    if abs(dx_y - dx_x) > 1e-8:
+        print(f"Warning: dx_y != dx_x for {rows}x{cols}")
+
+    dx = dx_y
+    total_cells = rows * cols
+
+    print(f"\nRunning grid {rows} x {cols} ({total_cells} cells), dx = {dx:.6f}")
+
+    wl_runs = []
+    xc_runs = []
+
+    start_time = time.perf_counter()
+
+    for sd in SEEDS:
+        t_sim, wl_sim, xc_sim = run_hybrid_one_grid(
+            rows=rows,
+            cols=cols,
+            dx=dx,
+            seed=sd,
+            record_times=RECORD_TIMES
+        )
+
+        wl_runs.append(wl_sim)
+        xc_runs.append(xc_sim)
+
+    elapsed = time.perf_counter() - start_time
+
+    wl_mean = np.mean(np.asarray(wl_runs), axis=0)
+    xc_mean = np.mean(np.asarray(xc_runs), axis=0)
+
+    grid_label = f"{rows}x{cols}"
+
+    all_curves[grid_label] = {
+        "rows": rows,
+        "cols": cols,
+        "total_cells": total_cells,
+        "dx": dx,
+        "time_h": RECORD_TIMES,
+        "tau": RECORD_TIMES / T_END,
+        "wl_percent": 100.0 * wl_mean,
+        "xc_percent": 100.0 * xc_mean,
+        "calculation_time_s": elapsed
+    }
+
+    summary_rows.append({
+        "grid": grid_label,
+        "rows": rows,
+        "cols": cols,
+        "total_cells": total_cells,
+        "dx": dx,
+        "calculation_time_s": elapsed
+    })
+
+    print(f"Finished {grid_label}: calculation time = {elapsed:.2f} s")
+
+
+# ============================================================
+# RMSE AGAINST FINEST GRID REFERENCE
+# ============================================================
+reference_label = f"{GRID_SIZES[-1][0]}x{GRID_SIZES[-1][1]}"
+wl_ref = all_curves[reference_label]["wl_percent"]
+xc_ref = all_curves[reference_label]["xc_percent"]
+
+for row in summary_rows:
+    label = row["grid"]
+
+    wl = all_curves[label]["wl_percent"]
+    xc = all_curves[label]["xc_percent"]
+
+    row["rmse_wl_percent"] = np.sqrt(np.mean((wl - wl_ref) ** 2))
+    row["rmse_xc_percent"] = np.sqrt(np.mean((xc - xc_ref) ** 2))
+
+
+summary_df = pd.DataFrame(summary_rows)
+
+
+# ============================================================
+# SAVE EXCEL FILES
+# ============================================================
+excel_curves_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_grid_sensitivity_curves_{timestamp}.xlsx"
+)
+
+with pd.ExcelWriter(excel_curves_path, engine="openpyxl") as writer:
+    summary_df.to_excel(writer, sheet_name="summary", index=False)
+
+    for label, curve in all_curves.items():
+        df = pd.DataFrame({
+            "time_h": curve["time_h"],
+            "dimensionless_time_tau": curve["tau"],
+            "weight_loss_percent": curve["wl_percent"],
+            "crystallinity_percent": curve["xc_percent"]
+        })
+
+        df.to_excel(writer, sheet_name=label, index=False)
+
+
+param_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_fixed_parameters_grid_sensitivity_{timestamp}.xlsx"
+)
+
+param_df = pd.DataFrame({
+    "parameter": [
+        "k1", "k3", "k_conv", "k_deg_C", "k_deg_A", "Mnc",
+        "k_det", "D_E_intact", "D_E_void_ratio",
+        "D_O_poly", "D_O_void_ratio", "PHI_WINDOW", "M_SOL"
+    ],
+    "value": [
+        k1, k3, k_conv, k_deg_C, k_deg_A, Mnc,
+        k_det, D_E_intact, D_E_void_ratio,
+        D_O_poly, D_O_void_ratio, PHI_WINDOW, M_SOL
+    ]
+})
+
+with pd.ExcelWriter(param_path, engine="openpyxl") as writer:
+    param_df.to_excel(writer, sheet_name="fixed_parameters", index=False)
+    summary_df.to_excel(writer, sheet_name="grid_summary", index=False)
+
+
+# ============================================================
+# PLOT SETTINGS
+# ============================================================
+# Fixed colours requested
+WL_RMSE_COLOR = "red"
+XC_RMSE_COLOR = "green"
+TIME_COLOR = "blue"
+WIREFRAME_COLOR = "black"
+
+plt.rcParams.update({
+    "font.size": 18,
+    "axes.labelsize": 24,
+    "axes.labelweight": "bold",
+    "xtick.labelsize": 20,
+    "ytick.labelsize": 20,
+    "legend.fontsize": 17,
+    "axes.linewidth": 1.8,
+    "xtick.major.width": 1.6,
+    "ytick.major.width": 1.6,
+    "xtick.major.size": 7,
+    "ytick.major.size": 7,
+})
+
+
+def format_lattice_cell_axis(ax):
+    """Format large lattice-cell counts so tick labels do not overlap."""
+    ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+    ax.xaxis.get_offset_text().set_fontsize(18)
+    ax.xaxis.get_offset_text().set_fontweight("bold")
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.tick_params(axis="x", labelrotation=0, pad=8)
+
+def format_grid_dimension_axis(ax, labels, rotation=25):
+    """
+    Use grid dimensions such as 10x333, 20x666, etc.
+    This avoids crowded large-number total-cell labels.
+    """
+    x = np.arange(len(labels))
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        labels,
+        rotation=rotation,
+        ha="right",
+        fontsize=16,
+        fontweight="bold"
+    )
+    ax.margins(x=0.04)
+    return x
+
+
+
+# ============================================================
+# 2D CURVES: WEIGHT LOSS AND CRYSTALLINITY
+# ============================================================
+# ============================================================
+# 2D CURVES: WEIGHT LOSS AND CRYSTALLINITY
+# ============================================================
+fig, ax = plt.subplots(figsize=(10, 7))
+
+for label, curve in all_curves.items():
+    ax.plot(
+        curve["time_h"],
+        curve["wl_percent"],
+        linewidth=4,
+        label=label
+    )
+
+ax.set_xlabel("Time (h)")
+ax.set_ylabel("Weight loss (%)")
+ax.grid(alpha=0.3)
+ax.legend(frameon=True, ncol=2)
+plt.tight_layout()
+
+wl_curve_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_grid_sensitivity_weight_loss_{timestamp}.png"
+)
+plt.savefig(wl_curve_path, dpi=600, bbox_inches="tight")
+plt.show()
+
+
+fig, ax = plt.subplots(figsize=(10, 7))
+
+for label, curve in all_curves.items():
+    ax.plot(
+        curve["time_h"],
+        curve["xc_percent"],
+        linewidth=4,
+        label=label
+    )
+
+ax.set_xlabel("Time (h)")
+ax.set_ylabel("Crystallinity (%)")
+ax.grid(alpha=0.3)
+ax.legend(frameon=True, ncol=2)
+plt.tight_layout()
+
+xc_curve_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_grid_sensitivity_crystallinity_{timestamp}.png"
+)
+plt.savefig(xc_curve_path, dpi=600, bbox_inches="tight")
+plt.show()
+
+
+# ============================================================
+# RMSE PLOT: WEIGHT LOSS ONLY
+# ============================================================
+fig, ax = plt.subplots(figsize=(11, 7))
+
+grid_labels = summary_df["grid"].tolist()
+x = np.arange(len(grid_labels))
+
+ax.plot(
+    x,
+    summary_df["rmse_wl_percent"],
+    marker="o",
+    markersize=10,
+    linewidth=4,
+    color=WL_RMSE_COLOR,
+    label="Weight loss RMSE"
+)
+
+ax.set_xlabel("Grid dimension")
+ax.set_ylabel("RMSE for weight loss (%)")
+format_grid_dimension_axis(ax, grid_labels, rotation=25)
+
+
+ax.grid(alpha=0.3)
+ax.legend(frameon=True)
+plt.tight_layout()
+
+rmse_wl_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_grid_convergence_rmse_weight_loss_{timestamp}.png"
+)
+plt.savefig(rmse_wl_path, dpi=600, bbox_inches="tight")
+plt.show()
+
+
+# ============================================================
+# RMSE PLOT: CRYSTALLINITY ONLY
+# ============================================================
+fig, ax = plt.subplots(figsize=(11, 7))
+
+grid_labels = summary_df["grid"].tolist()
+x = np.arange(len(grid_labels))
+
+ax.plot(
+    x,
+    summary_df["rmse_xc_percent"],
+    marker="s",
+    markersize=10,
+    linewidth=4,
+    color=XC_RMSE_COLOR,
+    label="Crystallinity RMSE"
+)
+
+ax.set_xlabel("Grid dimension")
+ax.set_ylabel("RMSE for crystallinity (%)")
+format_grid_dimension_axis(ax, grid_labels, rotation=25)
+
+
+ax.grid(alpha=0.3)
+ax.legend(frameon=True)
+plt.tight_layout()
+
+rmse_xc_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_grid_convergence_rmse_crystallinity_{timestamp}.png"
+)
+plt.savefig(rmse_xc_path, dpi=600, bbox_inches="tight")
+plt.show()
+
+
+
+rmse_path = rmse_wl_path
+
+
+# ============================================================
+# COMPUTATIONAL TIME PLOT
+# ============================================================
+fig, ax = plt.subplots(figsize=(11, 7))
+
+grid_labels = summary_df["grid"].tolist()
+x = np.arange(len(grid_labels))
+
+ax.plot(
+    x,
+    summary_df["calculation_time_s"],
+    marker="o",
+    markersize=10,
+    linewidth=4,
+    color=TIME_COLOR,
+    label="Calculation time"
+)
+
+ax.set_xlabel("Grid dimension")
+ax.set_ylabel("Calculation time (seconds)")
+format_grid_dimension_axis(ax, grid_labels, rotation=25)
+
+
+ax.grid(alpha=0.3)
+ax.legend(frameon=True)
+plt.tight_layout()
+
+time_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_grid_convergence_calculation_time_{timestamp}.png"
+)
+plt.savefig(time_path, dpi=600, bbox_inches="tight")
+plt.show()
+
+
+# ============================================================
+# 3D WIREFRAME DATA
+# ============================================================
+grid_labels_for_wire = list(all_curves.keys())
+grid_index = np.arange(len(grid_labels_for_wire), dtype=float)
+
+tau = RECORD_TIMES / T_END
+
+TAU, GRID = np.meshgrid(tau, grid_index)
+
+WL_SURF = np.vstack([
+    all_curves[label]["wl_percent"]
+    for label in all_curves.keys()
+])
+
+XC_SURF = np.vstack([
+    all_curves[label]["xc_percent"]
+    for label in all_curves.keys()
+])
+
+def plot_full_wireframe(ax, X, Y, Z, line_width=1.6, color="black"):
+    """
+    Draw both wireframe directions explicitly using one fixed colour.
+
+    This avoids the default multi-colour 3D line cycling and forces all
+    horizontal and vertical wireframe lines to use the same visual style.
+    """
+    # Lines along time for each grid size
+    for i in range(Z.shape[0]):
+        ax.plot(
+            X[i, :], Y[i, :], Z[i, :],
+            linewidth=line_width,
+            color=color
+        )
+
+    # Lines along grid size for selected time locations
+    n_time_lines = min(21, Z.shape[1])
+    time_indices = np.unique(
+        np.linspace(0, Z.shape[1] - 1, n_time_lines).astype(int)
+    )
+
+    for j in time_indices:
+        ax.plot(
+            X[:, j], Y[:, j], Z[:, j],
+            linewidth=line_width,
+            color=color
+        )
+
+def style_3d_axes(ax, zlabel):
+    ax.set_xlabel(r"Dimensionless time, $\tau=t/t_{\max}$",
+                  labelpad=24, fontsize=24, fontweight="bold")
+    ax.set_ylabel("Grid dimension",
+                  labelpad=30, fontsize=24, fontweight="bold")
+    ax.set_zlabel(zlabel,
+                  labelpad=34, fontsize=24, fontweight="bold")
+
+    ax.tick_params(axis="x", labelsize=18, width=1.5, pad=6)
+    ax.tick_params(axis="y", labelsize=18, width=1.5, pad=6)
+    ax.tick_params(axis="z", labelsize=18, width=1.5, pad=10)
+
+    # Use grid-dimension labels on the 3D y-axis.
+    try:
+        ax.set_yticks(grid_index)
+        ax.set_yticklabels(grid_labels_for_wire, fontsize=14, fontweight="bold")
+    except Exception:
+        pass
+
+    # Give labels more room so vertical axis labels are not clipped.
+    ax.xaxis.label.set_clip_on(False)
+    ax.yaxis.label.set_clip_on(False)
+    ax.zaxis.label.set_clip_on(False)
+
+    ax.view_init(elev=28, azim=-135)
+
+    # Slightly enlarge the visible box and improve proportions.
+    try:
+        ax.set_box_aspect((1.35, 1.0, 0.75))
+    except Exception:
+        pass
+
+
+
+# ============================================================
+# 3D WIREFRAME: WEIGHT LOSS
+# ============================================================
+fig = plt.figure(figsize=(12.5, 9.5))
+ax = fig.add_subplot(111, projection="3d")
+
+plot_full_wireframe(ax, TAU, GRID, WL_SURF, line_width=1.7, color=WIREFRAME_COLOR)
+style_3d_axes(ax, "Weight loss (%)")
+
+# Avoid tight_layout for 3D axes; it often clips z-axis labels.
+fig.subplots_adjust(
+    left=0.02,
+    right=0.90,
+    bottom=0.08,
+    top=0.96
+)
+
+wire_wl_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_wireframe_weight_loss_{timestamp}.png"
+)
+plt.savefig(
+    wire_wl_path,
+    dpi=600,
+    bbox_inches="tight",
+    pad_inches=0.85
+)
+plt.show()
+
+
+# ============================================================
+# 3D WIREFRAME: CRYSTALLINITY
+# ============================================================
+fig = plt.figure(figsize=(12.5, 9.5))
+ax = fig.add_subplot(111, projection="3d")
+
+plot_full_wireframe(ax, TAU, GRID, XC_SURF, line_width=1.7, color=WIREFRAME_COLOR)
+style_3d_axes(ax, "Crystallinity (%)")
+
+# Avoid tight_layout for 3D axes; it often clips z-axis labels.
+fig.subplots_adjust(
+    left=0.02,
+    right=0.90,
+    bottom=0.08,
+    top=0.96
+)
+
+wire_xc_path = os.path.join(
+    OUTPUT_DIR,
+    f"PCL6500_wireframe_crystallinity_{timestamp}.png"
+)
+plt.savefig(
+    wire_xc_path,
+    dpi=600,
+    bbox_inches="tight",
+    pad_inches=0.85
+)
+plt.show()
+
+
+# ============================================================
+# PRINT SAVED FILES
+# ============================================================
+print("\n================ SAVED FILES ================")
+print(f"Curve Excel file: {excel_curves_path}")
+print(f"Parameter Excel file: {param_path}")
+print(f"Weight loss curve plot: {wl_curve_path}")
+print(f"Crystallinity curve plot: {xc_curve_path}")
+print(f"Weight loss RMSE plot: {rmse_wl_path}")
+print(f"Crystallinity RMSE plot: {rmse_xc_path}")
+print(f"Calculation time plot: {time_path}")
+print(f"Weight loss wireframe: {wire_wl_path}")
+print(f"Crystallinity wireframe: {wire_xc_path}")
+
+print("\nDone.")
