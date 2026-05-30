@@ -1,0 +1,1934 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from datetime import datetime
+import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
+from scipy.sparse.linalg import spsolve
+from scipy.sparse import csr_matrix
+
+
+# ============================================================
+# OUTPUT FOLDER
+# ============================================================
+DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+OUTPUT_DIR = os.path.join(
+    DOWNLOADS_DIR,
+    "Hybrid_CA_PDE_AllPCL_FixedParams_Snapshots"
+)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"Results will be saved in:\n{OUTPUT_DIR}")
+
+
+# ============================================================
+# 0) DATA, FIXED PARAMETERS, AND SNAPSHOT TIMES FOR ALL PCL GRADES
+# ============================================================
+CURRENT_POLYMER = None
+
+ALL_POLYMER_DATA = {
+    "PCL6300": {
+        "MN0": 15723.72,
+        "X_FIXED": 0.65,
+        "t_xc": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "xc_obs": np.array([65, 62, 59, 51, 35, 9, 8.8, 8, 6], float) / 100.0,
+        "t_wl": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "wl_obs": np.array([0, 9, 18, 38, 54, 67, 85, 86, 87], float) / 100.0,
+    },
+    "PCL6500": {
+        "MN0": 32944.57,
+        "X_FIXED": 0.60,
+        "t_xc": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "xc_obs": np.array([60, 59, 56, 49, 36, 5, 4, 3, 2], float) / 100.0,
+        "t_wl": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "wl_obs": np.array([0, 9, 16, 38, 54, 70, 82, 83, 84], float) / 100.0,
+    },
+    "PCL6800": {
+        "MN0": 40931.18,
+        "X_FIXED": 0.60,
+        "t_xc": np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float),
+        "xc_obs": np.array([60, 58, 56, 52, 36, 5, 3.5, 3, 2], float) / 100.0,
+        "t_wl": np.array([0, 11, 23, 43, 61, 70, 83, 84, 85], float) / 100.0,
+        "wl_obs": np.array([0, 11, 23, 43, 61, 70, 83, 84, 85], float) / 100.0,
+    },
+}
+
+# Correct the accidental t_wl entry above for PCL6800.
+ALL_POLYMER_DATA["PCL6800"]["t_wl"] = np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], float)
+
+# Parameter order:
+# k1, k3, k_conv, k_deg_C, k_deg_A, Mnc, k_det,
+# D_E_intact, D_E_void_ratio, D_O_poly, D_O_void_ratio
+ALL_THETA_FIXED = {
+    # Parameter order:
+    # k1, k3, k_conv, k_deg_C, k_deg_A, Mnc, k_det,
+    # D_E_intact, D_E_void_ratio, D_O_poly, D_O_void_ratio
+    "PCL6300": np.array([1.47, 7.86, 0.15, 0.15, 1.23, 6290.0, 1.39, 36.58, 2.67, 33.52, 84.41], dtype=float),
+    "PCL6500": np.array([0.69, 4.93, 0.20, 0.20, 2.45, 10073.0, 2.69, 19.90, 3.20, 11.40, 66.12], dtype=float),
+    "PCL6800": np.array([1.10, 3.12, 0.20, 0.24, 2.56, 12012.0, 2.96, 30.74, 2.64, 23.52, 87.68], dtype=float),
+}
+
+# SEM/simulation snapshot times for all polymers.
+t_fit = np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], dtype=float)
+T_END = float(np.max(t_fit))
+
+# SEM-style zoom settings for comparison with SEM panels.
+FIELD_WIDTH_UM = 250.0
+SCALE_BAR_UM = 50.0
+ZOOM_FIELD_WIDTH_UM = 150.0
+ZOOM_FRACTION = 0.35
+
+# ============================================================
+# 2) FIXED PHYSICAL DOMAIN + GRID REFINEMENT
+# ============================================================
+BASE_ROWS = 10
+BASE_COLS = 333
+BASE_DX = 1.0
+
+L_Y = BASE_ROWS * BASE_DX
+L_X = BASE_COLS * BASE_DX
+
+# Your pasted code used TARGET_ROWS = 30.
+# This refines the grid while preserving the physical film size.
+TARGET_ROWS = 30
+DX = L_Y / TARGET_ROWS
+ROWS = int(TARGET_ROWS)
+COLS = int(round(L_X / DX))
+
+DT = 0.05
+
+S_CRYST = 1
+S_AMORPH = 0
+S_DEG = 2
+S_VOID = -1
+
+ORIGIN_NONE = 0
+ORIGIN_C = 1
+ORIGIN_A = 2
+
+E_BATH = 1.0
+O_BATH = 0.0
+PHI_WINDOW = 1
+M_SOL = 8
+M0_REPEAT = 114.14
+
+SEED = 42
+ENZYME_NEIGHBOUR_THRESHOLD = 1e-12
+
+print("\n================ GRID REFINEMENT ================")
+print(f"Baseline grid: {BASE_ROWS} x {BASE_COLS}")
+print(f"Baseline DX: {BASE_DX}")
+print(f"Fixed physical size: L_Y = {L_Y}, L_X = {L_X}")
+print(f"Current grid: {ROWS} x {COLS}")
+print(f"DX = {DX:.6f}")
+print(f"Actual physical size: {ROWS * DX:.6f} x {COLS * DX:.6f}")
+print(f"M_SOL = {M_SOL} repeat units")
+print(f"Snapshot times = {t_fit}")
+
+# Square centre crop for SEM-style local morphology comparison.
+# With TARGET_ROWS=30, this gives a 30 x 30 local window.
+ZOOM_SIZE_CELLS = min(ROWS, COLS)
+print(f"SEM square zoom size = {ZOOM_SIZE_CELLS} x {ZOOM_SIZE_CELLS} cells")
+
+
+# ============================================================
+# 3) POROSITY-DEPENDENT DIFFUSIVITY
+# ============================================================
+def compute_porosity_field(phase, window):
+    void_only = (phase == S_VOID).astype(float)
+    ny, nx = phase.shape
+    phi = np.zeros_like(void_only, dtype=float)
+
+    pad = max(int(window), 1)
+    padded_void = np.pad(
+        void_only,
+        pad_width=pad,
+        mode="constant",
+        constant_values=1.0
+    )
+
+    w = 2 * pad + 1
+
+    for dj in range(-pad, pad + 1):
+        for di in range(-pad, pad + 1):
+            phi += padded_void[
+                pad + dj:pad + dj + ny,
+                pad + di:pad + di + nx
+            ]
+
+    phi /= float(w * w)
+    return phi
+
+
+def effective_diffusivity(phi, D_intact, D_void_ratio):
+    return D_intact * (1.0 + (D_void_ratio - 1.0) * phi)
+
+
+# ============================================================
+# 4) SAME-GRID FOUR-SIDED DIFFUSION PDE
+# ============================================================
+def build_diffusion_matrix(D_field, dt, dx, bath_value):
+    ny, nx = D_field.shape
+
+    n_solve_rows = ny - 2
+    n_solve_cols = nx - 2
+
+    if n_solve_rows <= 0 or n_solve_cols <= 0:
+        raise ValueError("ROWS and COLS must both be at least 3.")
+
+    N = n_solve_rows * n_solve_cols
+
+    def idx(j, i):
+        return (j - 1) * n_solve_cols + (i - 1)
+
+    rows, cols, vals = [], [], []
+    rhs_extra = np.zeros(N)
+
+    for j in range(1, ny - 1):
+        for i in range(1, nx - 1):
+            k = idx(j, i)
+            diag_val = 1.0
+
+            for dj, di in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                jj, ii = j + dj, i + di
+
+                D_face = 0.5 * (D_field[j, i] + D_field[jj, ii])
+                coef = dt * D_face / dx**2
+
+                if jj == 0 or jj == ny - 1 or ii == 0 or ii == nx - 1:
+                    rhs_extra[k] += coef * bath_value
+                else:
+                    rows.append(k)
+                    cols.append(idx(jj, ii))
+                    vals.append(-coef)
+
+                diag_val += coef
+
+            rows.append(k)
+            cols.append(k)
+            vals.append(diag_val)
+
+    A = csr_matrix((vals, (rows, cols)), shape=(N, N))
+    return A, rhs_extra
+
+
+def diffuse_field(field, phase, D_intact, D_void_ratio, dt, dx, bath_value):
+    ny, nx = field.shape
+
+    phi = compute_porosity_field(phase, window=PHI_WINDOW)
+    D_field = effective_diffusivity(phi, D_intact, D_void_ratio)
+
+    A, rhs_extra = build_diffusion_matrix(
+        D_field,
+        dt,
+        dx,
+        bath_value=bath_value
+    )
+
+    rhs = field[1:-1, 1:-1].flatten() + rhs_extra
+    internal_new = spsolve(A, rhs).reshape(ny - 2, nx - 2)
+
+    out = field.copy()
+    out[0, :] = bath_value
+    out[-1, :] = bath_value
+    out[:, 0] = bath_value
+    out[:, -1] = bath_value
+    out[1:-1, 1:-1] = internal_new
+
+    np.clip(out, 0.0, None, out=out)
+    return out
+
+
+def diffuse_E(E_field, phase, D_E_intact, D_E_void_ratio, dt, dx):
+    return diffuse_field(
+        E_field,
+        phase,
+        D_E_intact,
+        D_E_void_ratio,
+        dt,
+        dx,
+        E_BATH
+    )
+
+
+def diffuse_oligomer(O_field, phase, D_O_poly, D_O_void_ratio, dt, dx):
+    return diffuse_field(
+        O_field,
+        phase,
+        D_O_poly,
+        D_O_void_ratio,
+        dt,
+        dx,
+        O_BATH
+    )
+
+
+# ============================================================
+# 5) MOLECULAR WEIGHT + CHAIN TRACKING
+# ============================================================
+def recalc_Mn_from_Nk_cell(Nk_cell):
+    k_vals = np.arange(Nk_cell.size, dtype=float)
+    total_units = np.sum(k_vals * Nk_cell)
+    total_chains = np.sum(Nk_cell)
+
+    if total_chains <= 0 or total_units <= 0:
+        return 0.0
+
+    return M0_REPEAT * total_units / total_chains
+
+
+def perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng):
+    Nk_cell = Nk[j, i, :]
+
+    # Only chains longer than the soluble oligomer threshold are eligible
+    # for further scission. Fragments with k <= M_SOL are immediately
+    # treated as soluble oligomers and transferred to the oligomer PDE field.
+    available = np.where(Nk_cell > 0)[0]
+    available = available[available >= M_SOL + 1]
+
+    if available.size == 0:
+        return False
+
+    weights = Nk_cell[available].astype(float)
+    weights /= np.sum(weights)
+
+    k_old = int(rng.choice(available, p=weights))
+    r = int(rng.integers(1, k_old))
+
+    Nk[j, i, k_old] -= 1
+    Nk[j, i, r] += 1
+    Nk[j, i, k_old - r] += 1
+
+    Mn_field[j, i] = recalc_Mn_from_Nk_cell(Nk[j, i, :])
+    return True
+
+
+def move_m8_oligomers_to_PDE(
+    Nk,
+    Mn_field,
+    mass_field,
+    O_field,
+    j,
+    i,
+    N0_REPEAT,
+    m_sol=M_SOL
+):
+    m = int(max(1, min(m_sol, Nk.shape[2] - 1)))
+
+    small_counts = Nk[j, i, 1:m + 1].astype(float)
+
+    if np.sum(small_counts) <= 0:
+        return 0.0
+
+    k_vals = np.arange(1, m + 1, dtype=float)
+    soluble_units = float(np.sum(k_vals * small_counts))
+
+    if soluble_units <= 0.0:
+        return 0.0
+
+    soluble_fraction = soluble_units / float(N0_REPEAT)
+
+    mass_field[j, i] = max(0.0, mass_field[j, i] - soluble_fraction)
+    O_field[j, i] += soluble_fraction
+
+    Nk[j, i, 1:m + 1] = 0
+    Mn_field[j, i] = recalc_Mn_from_Nk_cell(Nk[j, i, :])
+
+    return soluble_fraction
+
+
+# ============================================================
+# 6) VON NEUMANN ENZYME NEIGHBOURHOOD FOR EROSION
+# ============================================================
+def von_neumann_enzyme_sum(E_field):
+    Esum = np.zeros_like(E_field, dtype=float)
+
+    Esum[1:, :] += E_field[:-1, :]
+    Esum[:-1, :] += E_field[1:, :]
+    Esum[:, 1:] += E_field[:, :-1]
+    Esum[:, :-1] += E_field[:, 1:]
+
+    Esum[0, :] += E_BATH
+    Esum[-1, :] += E_BATH
+    Esum[:, 0] += E_BATH
+    Esum[:, -1] += E_BATH
+
+    return Esum
+
+
+def boundary_contact_mask(shape):
+    ny, nx = shape
+    mask = np.zeros((ny, nx), dtype=bool)
+    mask[0, :] = True
+    mask[-1, :] = True
+    mask[:, 0] = True
+    mask[:, -1] = True
+    return mask
+
+
+def update_voids_from_Mnc_and_von_neumann_enzyme(
+    phase,
+    Mn_field,
+    Nk,
+    deg_origin,
+    mass_field,
+    Mnc,
+    E_field,
+    k_det,
+    rng,
+    dt
+):
+    E_neigh_sum = von_neumann_enzyme_sum(E_field)
+    has_E_neigh = E_neigh_sum > ENZYME_NEIGHBOUR_THRESHOLD
+
+    boundary_contact = boundary_contact_mask(phase.shape)
+
+    eligible = (
+        (phase == S_DEG)
+        &
+        (
+            boundary_contact
+            | (Mn_field <= Mnc)
+        )
+        &
+        has_E_neigh
+    )
+
+    E_neigh_mean = E_neigh_sum / 4.0
+    P_void = 1.0 - np.exp(-k_det * E_neigh_mean * dt)
+    P_void = np.clip(P_void, 0.0, 1.0)
+
+    erode = eligible & (rng.random(phase.shape) < P_void)
+
+    phase[erode] = S_VOID
+    Mn_field[erode] = 0.0
+    mass_field[erode] = 0.0
+    Nk[erode, :] = 0
+    deg_origin[erode] = ORIGIN_NONE
+
+
+# ============================================================
+# 7) CA REACTION STEP
+# ============================================================
+def reaction_step(
+    phase,
+    bound,
+    E_field,
+    O_field,
+    Mn_field,
+    mass_field,
+    Nk,
+    deg_origin,
+    params,
+    rng,
+    dt,
+    N0_REPEAT
+):
+    k1, k3, k_conv, k_deg_C, k_deg_A, Mnc, k_det = params
+
+    ny, nx = phase.shape
+
+    phase_old = phase.copy()
+    bound_old = bound.copy()
+    E_old = E_field.copy()
+    origin_old = deg_origin.copy()
+
+    dE_quantum = E_BATH / max(ny * nx // 100, 1)
+
+    U1 = rng.random((ny, nx))
+    U2 = rng.random((ny, nx))
+
+    for j in range(ny):
+        for i in range(nx):
+            s = phase_old[j, i]
+            b = bound_old[j, i]
+            E_loc = E_old[j, i]
+
+            if s == S_VOID:
+                continue
+
+            u1 = U1[j, i]
+            u2 = U2[j, i]
+
+            if s == S_DEG:
+                origin = origin_old[j, i]
+
+                if origin == ORIGIN_C:
+                    rate = k_deg_C * E_loc
+                elif origin == ORIGIN_A:
+                    rate = k_deg_A * E_loc
+                else:
+                    rate = 0.0
+
+                P = 1.0 - np.exp(-rate * dt)
+
+                if u1 < P:
+                    perform_chain_scission_full_Nk(Nk, Mn_field, j, i, rng)
+
+                move_m8_oligomers_to_PDE(
+                    Nk,
+                    Mn_field,
+                    mass_field,
+                    O_field,
+                    j,
+                    i,
+                    N0_REPEAT
+                )
+
+                continue
+
+            if s == S_CRYST:
+                if not b:
+                    rate = k1 * E_loc
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P and E_loc > dE_quantum:
+                        bound[j, i] = True
+                        E_field[j, i] -= dE_quantum
+
+                else:
+                    rates = np.array([k_conv, k_deg_C], dtype=float)
+                    r_tot = np.sum(rates)
+
+                    if r_tot > 0:
+                        P = 1.0 - np.exp(-r_tot * dt)
+
+                        if u1 < P:
+                            cum = np.cumsum(rates) / r_tot
+
+                            if u2 < cum[0]:
+                                phase[j, i] = S_AMORPH
+                            else:
+                                phase[j, i] = S_DEG
+                                deg_origin[j, i] = ORIGIN_C
+
+                                perform_chain_scission_full_Nk(
+                                    Nk,
+                                    Mn_field,
+                                    j,
+                                    i,
+                                    rng
+                                )
+
+                                move_m8_oligomers_to_PDE(
+                                    Nk,
+                                    Mn_field,
+                                    mass_field,
+                                    O_field,
+                                    j,
+                                    i,
+                                    N0_REPEAT
+                                )
+
+                            bound[j, i] = False
+                            E_field[j, i] += dE_quantum
+
+                continue
+
+            if s == S_AMORPH:
+                if not b:
+                    rate = k3 * E_loc
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P and E_loc > dE_quantum:
+                        bound[j, i] = True
+                        E_field[j, i] -= dE_quantum
+
+                else:
+                    rate = k_deg_A
+                    P = 1.0 - np.exp(-rate * dt)
+
+                    if u1 < P:
+                        phase[j, i] = S_DEG
+                        deg_origin[j, i] = ORIGIN_A
+
+                        perform_chain_scission_full_Nk(
+                            Nk,
+                            Mn_field,
+                            j,
+                            i,
+                            rng
+                        )
+
+                        move_m8_oligomers_to_PDE(
+                            Nk,
+                            Mn_field,
+                            mass_field,
+                            O_field,
+                            j,
+                            i,
+                            N0_REPEAT
+                        )
+
+                        bound[j, i] = False
+                        E_field[j, i] += dE_quantum
+
+                continue
+
+    update_voids_from_Mnc_and_von_neumann_enzyme(
+        phase=phase,
+        Mn_field=Mn_field,
+        Nk=Nk,
+        deg_origin=deg_origin,
+        mass_field=mass_field,
+        Mnc=Mnc,
+        E_field=E_field,
+        k_det=k_det,
+        rng=rng,
+        dt=dt
+    )
+
+    E_field[0, :] = E_BATH
+    E_field[-1, :] = E_BATH
+    E_field[:, 0] = E_BATH
+    E_field[:, -1] = E_BATH
+
+    O_field[0, :] = O_BATH
+    O_field[-1, :] = O_BATH
+    O_field[:, 0] = O_BATH
+    O_field[:, -1] = O_BATH
+
+    np.clip(E_field, 0.0, None, out=E_field)
+    np.clip(O_field, 0.0, None, out=O_field)
+
+
+# ============================================================
+# 8) HYBRID CA/PDE SIMULATION DRIVER WITH SNAPSHOTS
+# ============================================================
+def run_hybrid(
+    theta,
+    MW0,
+    chi,
+    t_end,
+    seed,
+    record_times=None,
+    return_snapshots=True
+):
+    (
+        k1,
+        k3,
+        k_conv,
+        k_deg_C,
+        k_deg_A,
+        Mnc,
+        k_det,
+        D_E_intact,
+        D_E_void_ratio,
+        D_O_poly,
+        D_O_void_ratio
+    ) = theta
+
+    params_kinetic = (
+        k1,
+        k3,
+        k_conv,
+        k_deg_C,
+        k_deg_A,
+        Mnc,
+        k_det
+    )
+
+    rng = np.random.default_rng(seed)
+
+    ny, nx = ROWS, COLS
+
+    N0_REPEAT = int(round(MW0 / M0_REPEAT))
+    M_MAX = N0_REPEAT
+
+    phase = rng.choice(
+        [S_AMORPH, S_CRYST],
+        size=(ny, nx),
+        p=[1.0 - chi, chi]
+    ).astype(int)
+
+    bound = np.zeros((ny, nx), dtype=bool)
+    deg_origin = np.full((ny, nx), ORIGIN_NONE, dtype=int)
+
+    Nk = np.zeros((ny, nx, M_MAX + 1), dtype=np.int16)
+    Nk[:, :, N0_REPEAT] = 1
+
+    Mn_field = MW0 * np.ones((ny, nx), dtype=float)
+    mass_field = np.ones((ny, nx), dtype=float)
+    O_field = np.zeros((ny, nx), dtype=float)
+
+    E_field = np.zeros((ny, nx), dtype=float)
+    E_field[0, :] = E_BATH
+    E_field[-1, :] = E_BATH
+    E_field[:, 0] = E_BATH
+    E_field[:, -1] = E_BATH
+
+    if record_times is None:
+        record_times = np.linspace(0, t_end, 51)
+
+    record_times = np.asarray(record_times, dtype=float)
+
+    wl_record = []
+    xc_record = []
+    mn_record = []
+    olig_record = []
+    t_record = []
+
+    snapshots = {
+        "phase": {},
+        "enzyme": {},
+        "oligomer": {},
+    }
+
+    def metrics():
+        """
+        Mass-consistent observables for snapshot outputs.
+
+        Interpretation:
+        - mass_field is remaining non-soluble polymer mass in each cell.
+        - O_field is soluble/degraded oligomer mass still inside the film.
+        - Oligomer that diffuses out through the zero-bath boundary is removed
+          from O_field and therefore contributes to weight loss.
+        - Crystallinity is computed from remaining polymer mass, not cell counts:
+
+              Xc(t) = mC(t) / [mC(t) + mA(t) + mD(t) + mO_inside(t)]
+        """
+
+        nC = np.count_nonzero(phase == S_CRYST)
+        nA = np.count_nonzero(phase == S_AMORPH)
+        nD = np.count_nonzero(phase == S_DEG)
+        nV = np.count_nonzero(phase == S_VOID)
+
+        N_total = ny * nx
+
+        massC = np.sum(mass_field[phase == S_CRYST])
+        massA = np.sum(mass_field[phase == S_AMORPH])
+        massD = np.sum(mass_field[phase == S_DEG])
+        massO_inside = np.sum(O_field)
+
+        total_remaining_mass = massC + massA + massD + massO_inside
+
+        wl = 1.0 - total_remaining_mass / float(N_total)
+        wl = float(np.clip(wl, 0.0, 1.0))
+
+        xc = massC / total_remaining_mass if total_remaining_mass > 0 else 0.0
+
+        mn_global = recalc_Mn_from_Nk_cell(np.sum(Nk, axis=(0, 1)))
+        olig_inside = massO_inside / float(N_total)
+
+        return wl, xc, mn_global, olig_inside, nC, nA, nD, nV
+
+    t = 0.0
+    next_record_idx = 0
+
+    while (
+        next_record_idx < len(record_times)
+        and record_times[next_record_idx] <= t + 1e-12
+    ):
+        rec_t = float(record_times[next_record_idx])
+        wl, xc, mn_global, olig_inside, *_ = metrics()
+
+        wl_record.append(wl)
+        xc_record.append(xc)
+        mn_record.append(mn_global)
+        olig_record.append(olig_inside)
+        t_record.append(rec_t)
+
+        if return_snapshots:
+            snapshots["phase"][rec_t] = phase.copy()
+            snapshots["enzyme"][rec_t] = E_field.copy()
+            snapshots["oligomer"][rec_t] = O_field.copy()
+
+        next_record_idx += 1
+
+    while t < t_end - 1e-12:
+        E_field = diffuse_E(
+            E_field,
+            phase,
+            D_E_intact,
+            D_E_void_ratio,
+            DT,
+            DX
+        )
+
+        O_field = diffuse_oligomer(
+            O_field,
+            phase,
+            D_O_poly,
+            D_O_void_ratio,
+            DT,
+            DX
+        )
+
+        reaction_step(
+            phase=phase,
+            bound=bound,
+            E_field=E_field,
+            O_field=O_field,
+            Mn_field=Mn_field,
+            mass_field=mass_field,
+            Nk=Nk,
+            deg_origin=deg_origin,
+            params=params_kinetic,
+            rng=rng,
+            dt=DT,
+            N0_REPEAT=N0_REPEAT
+        )
+
+        t += DT
+
+        while (
+            next_record_idx < len(record_times)
+            and record_times[next_record_idx] <= t + 1e-12
+        ):
+            rec_t = float(record_times[next_record_idx])
+            wl, xc, mn_global, olig_inside, *_ = metrics()
+
+            wl_record.append(wl)
+            xc_record.append(xc)
+            mn_record.append(mn_global)
+            olig_record.append(olig_inside)
+            t_record.append(rec_t)
+
+            if return_snapshots:
+                snapshots["phase"][rec_t] = phase.copy()
+                snapshots["enzyme"][rec_t] = E_field.copy()
+                snapshots["oligomer"][rec_t] = O_field.copy()
+
+            next_record_idx += 1
+
+    if return_snapshots:
+        return (
+            np.array(t_record),
+            np.array(wl_record),
+            np.array(xc_record),
+            np.array(mn_record),
+            np.array(olig_record),
+            snapshots
+        )
+
+    return (
+        np.array(t_record),
+        np.array(wl_record),
+        np.array(xc_record),
+        np.array(mn_record),
+        np.array(olig_record)
+    )
+
+
+# ============================================================
+# 9) SAVE SNAPSHOT METRICS
+# ============================================================
+def save_snapshot_metrics(t_snap, wl_snap, xc_snap, mn_snap, olig_snap):
+    out_path = os.path.join(OUTPUT_DIR, f"{CURRENT_POLYMER}_snapshot_metrics.tsv")
+
+    with open(out_path, "w") as f:
+        f.write(
+            "time_h\tweight_loss_percent\tremaining_crystallinity_percent\t"
+            "Mn_global_g_mol\toligomer_inside_percent\n"
+        )
+
+        for tt, wl, xc, mn, olig in zip(t_snap, wl_snap, xc_snap, mn_snap, olig_snap):
+            f.write(
+                f"{tt:.6f}\t{100.0 * wl:.6f}\t{100.0 * xc:.6f}\t"
+                f"{mn:.6f}\t{100.0 * olig:.6f}\n"
+            )
+
+    print(f"Saved snapshot metrics:\n{out_path}")
+
+
+# ============================================================
+# 10) SNAPSHOT PLOTTING
+# ============================================================
+# Structure follows the old snapshot script:
+#   1) remaining polymer/species only
+#   2) enzyme only
+#   3) void only
+#   4) all species with enzyme overlay
+# The underlying model here remains the fixed-parameter full-Nk CA/PDE model.
+
+SPECIES_COLOURS = {
+    # SEM-comparison colour scheme:
+    # void/deep pores are black so that pore formation is visually dominant.
+    S_VOID:   "#000000",  # black: void / eroded / deep pore
+    S_AMORPH: "#1F77B4",  # blue: amorphous
+    S_CRYST:  "#D62728",  # red: crystalline
+    S_DEG:    "#FFD700",  # yellow/gold: degraded
+}
+
+ENZYME_COLOUR = "#00FF00"  # pure green
+
+cmap_species = mcolors.ListedColormap([
+    SPECIES_COLOURS[S_VOID],
+    SPECIES_COLOURS[S_AMORPH],
+    SPECIES_COLOURS[S_CRYST],
+    SPECIES_COLOURS[S_DEG],
+])
+
+bounds_species = [-1.5, -0.5, 0.5, 1.5, 2.5]
+norm_species = mcolors.BoundaryNorm(bounds_species, cmap_species.N)
+
+enzyme_cmap = mcolors.LinearSegmentedColormap.from_list(
+    "pure_green_enzyme",
+    [
+        (1.0, 1.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0, 1.0),
+    ]
+)
+
+oligomer_cmap = mcolors.LinearSegmentedColormap.from_list(
+    "oligomer_purple",
+    [
+        (1.0, 1.0, 1.0, 0.0),
+        (0.45, 0.0, 0.85, 1.0),
+    ]
+)
+
+
+def _present_states_from_arrays(arrays):
+    """Return the set of CA states that appear in a list/dict of arrays."""
+    present = set()
+    for arr in arrays:
+        present.update(np.unique(arr).astype(int).tolist())
+    return present
+
+
+def add_bottom_legend(
+    fig,
+    present_states=None,
+    include_enzyme=False,
+    include_oligomer=False,
+    binary_void_values=None,
+    y_anchor=0.015
+):
+    """
+    Add a legend containing only colours that are actually used in the plotted
+    snapshot type.
+
+    - present_states: CA states present in species snapshots.
+    - include_enzyme: add enzyme legend entry for enzyme-only or overlay plots.
+    - include_oligomer: add oligomer legend entry for oligomer-only plots.
+    - binary_void_values: set/list of values in void-only maps, where
+      0 = non-void background and 1 = void.
+    """
+    legend_patches = []
+
+    if present_states is not None:
+        ordered_states = [S_CRYST, S_AMORPH, S_DEG, S_VOID]
+        labels = {
+            S_CRYST: "Crystalline (C)",
+            S_AMORPH: "Amorphous (A)",
+            S_DEG: "Degraded (D)",
+            S_VOID: "Void / eroded (V)",
+        }
+
+        for state in ordered_states:
+            if state in present_states:
+                legend_patches.append(
+                    mpatches.Patch(
+                        facecolor=SPECIES_COLOURS[state],
+                        edgecolor="black",
+                        label=labels[state]
+                    )
+                )
+
+    if binary_void_values is not None:
+        vals = set(int(v) for v in binary_void_values)
+        if 0 in vals:
+            legend_patches.append(
+                mpatches.Patch(
+                    facecolor="#C8C8C8",
+                    edgecolor="black",
+                    label="Polymer"
+                )
+            )
+        if 1 in vals:
+            legend_patches.append(
+                mpatches.Patch(
+                    facecolor=SPECIES_COLOURS[S_VOID],
+                    edgecolor="black",
+                    label="Void / eroded (V)"
+                )
+            )
+
+    if include_enzyme:
+        legend_patches.append(
+            mpatches.Patch(
+                facecolor=ENZYME_COLOUR,
+                edgecolor="black",
+                label="Enzyme"
+            )
+        )
+
+    if include_oligomer:
+        legend_patches.append(
+            mpatches.Patch(
+                facecolor="#7300D9",
+                edgecolor="black",
+                label="Soluble oligomer"
+            )
+        )
+
+    if not legend_patches:
+        return
+
+    fig.legend(
+        handles=legend_patches,
+        loc="lower center",
+        ncol=len(legend_patches),
+        fontsize=15,
+        frameon=True,
+        bbox_to_anchor=(0.5, y_anchor),
+        handlelength=2.8,
+        columnspacing=1.8,
+        borderpad=0.8
+    )
+
+
+def plot_snapshot_set(
+    images,
+    snapshot_times,
+    title,
+    out_name,
+    cmap=None,
+    norm=None,
+    vmin=None,
+    vmax=None,
+    add_legend=True,
+    legend_mode="species"
+):
+    fig, axes = plt.subplots(
+        len(snapshot_times),
+        1,
+        figsize=(18, 1.55 * len(snapshot_times)),
+        constrained_layout=False
+    )
+
+    if len(snapshot_times) == 1:
+        axes = [axes]
+
+    for ax, tt in zip(axes, snapshot_times):
+        img = images[float(tt)]
+
+        ax.imshow(
+            img,
+            cmap=cmap,
+            norm=norm,
+            interpolation="nearest",
+            aspect="auto",
+            vmin=vmin if norm is None else None,
+            vmax=vmax if norm is None else None
+        )
+
+        ax.set_ylabel(
+            f"t = {tt:g} h",
+            fontsize=18,
+            fontweight="bold",
+            rotation=0,
+            labelpad=45,
+            va="center"
+        )
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    if add_legend:
+        arrays = [images[float(tt)] for tt in snapshot_times]
+
+        if legend_mode == "species":
+            present_states = _present_states_from_arrays(arrays)
+            add_bottom_legend(
+                fig,
+                present_states=present_states,
+                y_anchor=0.015
+            )
+
+        elif legend_mode == "void":
+            binary_values = set()
+            for arr in arrays:
+                binary_values.update(np.unique(arr).astype(int).tolist())
+            add_bottom_legend(
+                fig,
+                binary_void_values=binary_values,
+                y_anchor=0.015
+            )
+
+        elif legend_mode == "enzyme":
+            add_bottom_legend(
+                fig,
+                include_enzyme=True,
+                y_anchor=0.015
+            )
+
+        elif legend_mode == "oligomer":
+            add_bottom_legend(
+                fig,
+                include_oligomer=True,
+                y_anchor=0.015
+            )
+
+    plt.subplots_adjust(
+        left=0.10,
+        right=0.98,
+        top=0.99,
+        bottom=0.13 if add_legend else 0.03,
+        hspace=0.18
+    )
+
+    plt.savefig(out_name, dpi=600, bbox_inches="tight")
+    plt.show()
+
+    print(f"Saved: {out_name}")
+
+
+
+def crop_center_square(img, size_cells=ZOOM_SIZE_CELLS):
+    ny, nx = img.shape
+    size = int(max(1, min(size_cells, ny, nx)))
+
+    j0 = ny // 2 - size // 2
+    i0 = nx // 2 - size // 2
+
+    return img[j0:j0 + size, i0:i0 + size]
+
+def add_scale_bar_to_axis(
+    ax,
+    image_shape,
+    zoom_field_width_um=ZOOM_FIELD_WIDTH_UM,
+    scale_bar_um=SCALE_BAR_UM,
+    colour="white",
+    text_colour="white"
+):
+    ny, nx = image_shape
+    cell_size_um = zoom_field_width_um / float(nx)
+    bar_cells = scale_bar_um / cell_size_um
+    bar_cells = min(bar_cells, 0.70 * nx)
+
+    x1 = 0.92 * nx
+    x0 = x1 - bar_cells
+    y0 = 0.90 * ny
+
+    ax.plot(
+        [x0, x1],
+        [y0, y0],
+        color=colour,
+        lw=5,
+        solid_capstyle="butt"
+    )
+
+    ax.text(
+        0.5 * (x0 + x1),
+        y0 - 0.06 * ny,
+        f"{scale_bar_um:.0f} µm",
+        color=text_colour,
+        fontsize=13,
+        ha="center",
+        va="bottom",
+        fontweight="bold"
+    )
+
+def plot_sem_style_zoom_snapshots(snapshots, snapshot_times):
+    """
+    Produce separate central zoom snapshots with a 50 µm scale bar:
+      1) species-colour zoom
+      2) SEM-like void/solid zoom
+      3) species + enzyme overlay zoom
+    """
+    phase_snaps = snapshots["phase"]
+    enzyme_snaps = snapshots["enzyme"]
+
+    # Use one common canvas and identical subplot margins for all zoomed outputs.
+    # Do not save zoom figures with bbox_inches="tight", because different legend
+    # widths can otherwise change the final PNG size.
+    zoom_figsize = (17, 2.85 * len(snapshot_times))
+    zoom_adjust = dict(left=0.08, right=0.995, top=0.995, bottom=0.08, hspace=0.018)
+
+    # --------------------------------------------------------
+    # 1) Species-colour central zoom
+    # --------------------------------------------------------
+    fig, axes = plt.subplots(
+        len(snapshot_times),
+        1,
+        figsize=zoom_figsize,
+        constrained_layout=False
+    )
+
+    if len(snapshot_times) == 1:
+        axes = [axes]
+
+    for ax, tt in zip(axes, snapshot_times):
+        phase_zoom = crop_center_square(phase_snaps[float(tt)])
+
+        ax.imshow(
+            phase_zoom,
+            cmap=cmap_species,
+            norm=norm_species,
+            interpolation="nearest",
+            aspect="equal"
+        )
+
+        add_scale_bar_to_axis(ax, phase_zoom.shape, colour="white", text_colour="white")
+
+        ax.set_ylabel(
+            f"t = {tt:g} h",
+            fontsize=17,
+            fontweight="bold",
+            rotation=0,
+            labelpad=45,
+            va="center"
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+    zoom_species_arrays = [
+        crop_center_square(phase_snaps[float(tt)])
+        for tt in snapshot_times
+    ]
+    zoom_present_states = _present_states_from_arrays(zoom_species_arrays)
+    add_bottom_legend(
+        fig,
+        present_states=zoom_present_states,
+        y_anchor=0.015
+    )
+
+    plt.subplots_adjust(**zoom_adjust)
+
+    out_species_zoom = os.path.join(
+        OUTPUT_DIR,
+        f"{CURRENT_POLYMER}_SEM_time_species_zoom_with_50um_scale_{ROWS}x{COLS}.png"
+    )
+    plt.savefig(out_species_zoom, dpi=600)
+    plt.show()
+    print(f"Saved: {out_species_zoom}")
+
+    # --------------------------------------------------------
+    # 2) SEM-like void/solid central zoom
+    #    Solid/degraded material is light grey, voids/deep pores are black.
+    # --------------------------------------------------------
+    sem_void_cmap = mcolors.ListedColormap([
+        "#C8C8C8",  # non-void polymer-like background
+        "#000000",  # void / deep pore
+    ])
+    sem_void_norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5], sem_void_cmap.N)
+
+    fig, axes = plt.subplots(
+        len(snapshot_times),
+        1,
+        figsize=zoom_figsize,
+        constrained_layout=False
+    )
+
+    if len(snapshot_times) == 1:
+        axes = [axes]
+
+    for ax, tt in zip(axes, snapshot_times):
+        phase_zoom = crop_center_square(phase_snaps[float(tt)])
+        void_zoom = np.where(phase_zoom == S_VOID, 1, 0)
+
+        ax.imshow(
+            void_zoom,
+            cmap=sem_void_cmap,
+            norm=sem_void_norm,
+            interpolation="nearest",
+            aspect="equal"
+        )
+
+        add_scale_bar_to_axis(ax, void_zoom.shape, colour="white", text_colour="white")
+
+        ax.set_ylabel(
+            f"t = {tt:g} h",
+            fontsize=17,
+            fontweight="bold",
+            rotation=0,
+            labelpad=45,
+            va="center"
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    zoom_void_values = set()
+    for tt in snapshot_times:
+        phase_zoom = crop_center_square(phase_snaps[float(tt)])
+        void_zoom = np.where(phase_zoom == S_VOID, 1, 0)
+        zoom_void_values.update(np.unique(void_zoom).astype(int).tolist())
+
+    add_bottom_legend(
+        fig,
+        binary_void_values=zoom_void_values,
+        y_anchor=0.015
+    )
+
+    plt.subplots_adjust(**zoom_adjust)
+
+    out_void_zoom = os.path.join(
+        OUTPUT_DIR,
+        f"{CURRENT_POLYMER}_SEM_time_void_zoom_with_50um_scale_{ROWS}x{COLS}.png"
+    )
+    plt.savefig(out_void_zoom, dpi=600)
+    plt.show()
+    print(f"Saved: {out_void_zoom}")
+
+    # --------------------------------------------------------
+    # 3) Species with enzyme overlay central zoom
+    # --------------------------------------------------------
+    fig, axes = plt.subplots(
+        len(snapshot_times),
+        1,
+        figsize=zoom_figsize,
+        constrained_layout=False
+    )
+
+    if len(snapshot_times) == 1:
+        axes = [axes]
+
+    for ax, tt in zip(axes, snapshot_times):
+        phase_zoom = crop_center_square(phase_snaps[float(tt)])
+        enzyme_zoom = crop_center_square(enzyme_snaps[float(tt)])
+
+        ax.imshow(
+            phase_zoom,
+            cmap=cmap_species,
+            norm=norm_species,
+            interpolation="nearest",
+            aspect="equal"
+        )
+
+        enzyme_alpha = np.clip(enzyme_zoom / E_BATH, 0.0, 1.0) * 0.55
+
+        ax.imshow(
+            np.ones_like(enzyme_zoom),
+            cmap=mcolors.ListedColormap([ENZYME_COLOUR]),
+            interpolation="nearest",
+            aspect="equal",
+            alpha=enzyme_alpha,
+            vmin=0,
+            vmax=1
+        )
+
+        add_scale_bar_to_axis(ax, phase_zoom.shape, colour="white", text_colour="white")
+
+        ax.set_ylabel(
+            f"t = {tt:g} h",
+            fontsize=17,
+            fontweight="bold",
+            rotation=0,
+            labelpad=45,
+            va="center"
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+    zoom_overlay_arrays = [
+        crop_center_square(phase_snaps[float(tt)])
+        for tt in snapshot_times
+    ]
+    zoom_overlay_states = _present_states_from_arrays(zoom_overlay_arrays)
+    add_bottom_legend(
+        fig,
+        present_states=zoom_overlay_states,
+        include_enzyme=True,
+        y_anchor=0.015
+    )
+
+    plt.subplots_adjust(**zoom_adjust)
+
+    out_all_zoom = os.path.join(
+        OUTPUT_DIR,
+        f"{CURRENT_POLYMER}_SEM_time_all_species_zoom_with_50um_scale_{ROWS}x{COLS}.png"
+    )
+    plt.savefig(out_all_zoom, dpi=600)
+    plt.show()
+    print(f"Saved: {out_all_zoom}")
+
+    return {
+        "species_zoom": out_species_zoom,
+        "void_zoom": out_void_zoom,
+        "all_species_zoom": out_all_zoom,
+    }
+
+
+def plot_all_snapshot_types(snapshots, snapshot_times):
+    phase_snaps = snapshots["phase"]
+    enzyme_snaps = snapshots["enzyme"]
+    oligomer_snaps = snapshots["oligomer"]
+
+    # --------------------------------------------------------
+    # 1) Remaining polymer / species only
+    # --------------------------------------------------------
+    remaining_species = {}
+
+    for tt in snapshot_times:
+        phase = phase_snaps[float(tt)]
+        remaining_species[float(tt)] = phase.copy()
+
+    out_remaining = os.path.join(
+        OUTPUT_DIR,
+        f"{CURRENT_POLYMER}_remaining_polymer_consistent_colours_{ROWS}x{COLS}.png"
+    )
+
+    plot_snapshot_set(
+        images=remaining_species,
+        snapshot_times=snapshot_times,
+        title="Remaining polymer / species snapshot",
+        out_name=out_remaining,
+        cmap=cmap_species,
+        norm=norm_species,
+        add_legend=True
+    )
+
+    # --------------------------------------------------------
+    # 2) Enzyme only
+    # --------------------------------------------------------
+    enzyme_images = {}
+
+    for tt in snapshot_times:
+        enzyme = enzyme_snaps[float(tt)]
+        enzyme_images[float(tt)] = enzyme.copy()
+
+    out_enzyme = os.path.join(
+        OUTPUT_DIR,
+        f"{CURRENT_POLYMER}_enzyme_only_pure_green_{ROWS}x{COLS}.png"
+    )
+
+    fig, axes = plt.subplots(
+        len(snapshot_times),
+        1,
+        figsize=(18, 1.55 * len(snapshot_times)),
+        constrained_layout=False
+    )
+
+    if len(snapshot_times) == 1:
+        axes = [axes]
+
+    for ax, tt in zip(axes, snapshot_times):
+        enzyme = enzyme_images[float(tt)]
+
+        ax.imshow(
+            enzyme,
+            cmap=enzyme_cmap,
+            interpolation="nearest",
+            aspect="auto",
+            vmin=0.0,
+            vmax=E_BATH
+        )
+
+        ax.set_facecolor("white")
+        ax.set_ylabel(
+            f"t = {tt:g} h",
+            fontsize=18,
+            fontweight="bold",
+            rotation=0,
+            labelpad=45,
+            va="center"
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+    add_bottom_legend(
+        fig,
+        include_enzyme=True,
+        y_anchor=0.015
+    )
+
+    plt.subplots_adjust(left=0.10, right=0.98, top=0.99, bottom=0.13, hspace=0.18)
+    plt.savefig(out_enzyme, dpi=600, bbox_inches="tight")
+    plt.show()
+    print(f"Saved: {out_enzyme}")
+
+    # --------------------------------------------------------
+    # 3) Void only
+    # --------------------------------------------------------
+    void_cmap = mcolors.ListedColormap([
+        "#C8C8C8",                  # non-void polymer/background
+        SPECIES_COLOURS[S_VOID],    # void / eroded / deep pore = black
+    ])
+
+    void_norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5], void_cmap.N)
+
+    void_images = {}
+
+    for tt in snapshot_times:
+        phase = phase_snaps[float(tt)]
+        void_images[float(tt)] = np.where(phase == S_VOID, 1, 0)
+
+    out_void = os.path.join(
+        OUTPUT_DIR,
+        f"{CURRENT_POLYMER}_void_only_black_pores_{ROWS}x{COLS}.png"
+    )
+
+    plot_snapshot_set(
+        images=void_images,
+        snapshot_times=snapshot_times,
+        title="Void / eroded regions only (black pores)",
+        out_name=out_void,
+        cmap=void_cmap,
+        norm=void_norm,
+        add_legend=True,
+        legend_mode="void"
+    )
+
+    # --------------------------------------------------------
+    # 4) Soluble oligomer only
+    # --------------------------------------------------------
+    oligomer_images = {}
+    olig_max = 1e-12
+    for tt in snapshot_times:
+        olig = oligomer_snaps[float(tt)]
+        oligomer_images[float(tt)] = olig.copy()
+        olig_max = max(olig_max, float(np.max(olig)))
+
+    out_oligomer = os.path.join(
+        OUTPUT_DIR,
+        f"{CURRENT_POLYMER}_oligomer_only_purple_{ROWS}x{COLS}.png"
+    )
+
+    plot_snapshot_set(
+        images=oligomer_images,
+        snapshot_times=snapshot_times,
+        title="Soluble oligomer field only",
+        out_name=out_oligomer,
+        cmap=oligomer_cmap,
+        norm=None,
+        vmin=0.0,
+        vmax=olig_max,
+        add_legend=True,
+        legend_mode="oligomer"
+    )
+
+    # --------------------------------------------------------
+    # 5) All species together with enzyme overlay
+    # --------------------------------------------------------
+    fig, axes = plt.subplots(
+        len(snapshot_times),
+        1,
+        figsize=(18, 1.55 * len(snapshot_times)),
+        constrained_layout=False
+    )
+
+    if len(snapshot_times) == 1:
+        axes = [axes]
+
+    for ax, tt in zip(axes, snapshot_times):
+        phase = phase_snaps[float(tt)]
+        enzyme = enzyme_snaps[float(tt)]
+
+        ax.imshow(
+            phase,
+            cmap=cmap_species,
+            norm=norm_species,
+            interpolation="nearest",
+            aspect="auto"
+        )
+
+        enzyme_alpha = np.clip(enzyme / E_BATH, 0.0, 1.0) * 0.55
+
+        ax.imshow(
+            np.ones_like(enzyme),
+            cmap=mcolors.ListedColormap([ENZYME_COLOUR]),
+            interpolation="nearest",
+            aspect="auto",
+            alpha=enzyme_alpha,
+            vmin=0,
+            vmax=1
+        )
+
+        ax.set_ylabel(
+            f"t = {tt:g} h",
+            fontsize=18,
+            fontweight="bold",
+            rotation=0,
+            labelpad=45,
+            va="center"
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+    overlay_present_states = _present_states_from_arrays(
+        [phase_snaps[float(tt)] for tt in snapshot_times]
+    )
+    add_bottom_legend(
+        fig,
+        present_states=overlay_present_states,
+        include_enzyme=True,
+        y_anchor=0.015
+    )
+
+    plt.subplots_adjust(left=0.10, right=0.98, top=0.99, bottom=0.13, hspace=0.18)
+
+    out_all = os.path.join(
+        OUTPUT_DIR,
+        f"{CURRENT_POLYMER}_all_species_with_pure_green_enzyme_{ROWS}x{COLS}.png"
+    )
+
+    plt.savefig(out_all, dpi=600, bbox_inches="tight")
+    plt.show()
+    print(f"Saved: {out_all}")
+
+    return {
+        "remaining": out_remaining,
+        "enzyme": out_enzyme,
+        "void": out_void,
+        "oligomer": out_oligomer,
+        "all_species": out_all,
+    }
+
+
+
+
+# ============================================================
+# 11A) COMBINED ZOOM SNAPSHOT GRID: ROWS = TIMES, COLUMNS = PCL GRADES
+# ============================================================
+def polymer_display_name(polymer_name):
+    return polymer_name.replace("PCL", "PCL-")
+
+
+def plot_combined_zoom_snapshot_grid(all_snapshots_by_polymer, snapshot_times):
+    """
+    Put the central zoomed snapshots together in one SEM-style panel:
+
+        columns = PCL-6300, PCL-6500, PCL-6800
+        rows    = 0, 1, 2, 4, 6, 8, 12, 16, 20 h
+
+    This version reduces the large white space between columns by using
+    near-square subplot slots and tighter horizontal spacing.
+
+    Three combined figures are saved:
+      1) species colour zoom grid
+      2) SEM-like void/solid zoom grid
+      3) species + enzyme overlay zoom grid
+    """
+    polymer_order = ["PCL6300", "PCL6500", "PCL6800"]
+    n_rows = len(snapshot_times)
+    n_cols = len(polymer_order)
+
+    combined_dir = os.path.join(OUTPUT_DIR, "Combined_zoom_grids")
+    os.makedirs(combined_dir, exist_ok=True)
+
+    # Key layout fix:
+    # The previous width, 4.65 inches per column, was too wide for square images.
+    # This made each square sit in the middle of a wide subplot, producing the
+    # large white vertical bands between columns. These settings make the subplot
+    # slots closer to square and keep only a narrow SEM-style gap.
+    COMBINED_FIGSIZE = (3.15 * n_cols, 3.15 * n_rows)
+    COMBINED_ADJUST = dict(
+        left=0.115,
+        right=0.995,
+        top=0.975,
+        bottom=0.055,
+        wspace=0.045,
+        hspace=0.045
+    )
+
+    def _format_axes(ax, tt, col_idx, row_idx, polymer_name):
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        if row_idx == 0:
+            ax.set_title(
+                polymer_display_name(polymer_name),
+                fontsize=24,
+                fontweight="bold",
+                pad=4
+            )
+
+        if col_idx == 0:
+            ax.set_ylabel(
+                f"{tt:g}h",
+                fontsize=24,
+                rotation=0,
+                labelpad=10,
+                va="center",
+                ha="right"
+            )
+
+    # --------------------------------------------------------
+    # A) Species-colour combined zoom grid
+    # --------------------------------------------------------
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=COMBINED_FIGSIZE,
+        constrained_layout=False
+    )
+
+    if n_rows == 1:
+        axes = np.array([axes])
+
+    for r, tt in enumerate(snapshot_times):
+        for c, polymer_name in enumerate(polymer_order):
+            ax = axes[r, c]
+            phase = all_snapshots_by_polymer[polymer_name]["phase"][float(tt)]
+            phase_zoom = crop_center_square(phase)
+
+            ax.imshow(
+                phase_zoom,
+                cmap=cmap_species,
+                norm=norm_species,
+                interpolation="nearest",
+                aspect="equal"
+            )
+
+            add_scale_bar_to_axis(
+                ax,
+                phase_zoom.shape,
+                colour="white",
+                text_colour="white"
+            )
+
+            _format_axes(ax, tt, c, r, polymer_name)
+
+    present_states = set()
+    for polymer_name in polymer_order:
+        for tt in snapshot_times:
+            phase = crop_center_square(
+                all_snapshots_by_polymer[polymer_name]["phase"][float(tt)]
+            )
+            present_states.update(np.unique(phase).astype(int).tolist())
+
+    add_bottom_legend(fig, present_states=present_states, y_anchor=0.012)
+    plt.subplots_adjust(**COMBINED_ADJUST)
+
+    out_species = os.path.join(
+        combined_dir,
+        f"All_PCL_combined_species_zoom_grid_{ROWS}x{COLS}.png"
+    )
+    plt.savefig(out_species, dpi=600, bbox_inches="tight", pad_inches=0.02)
+    plt.show()
+    print(f"Saved combined species zoom grid: {out_species}")
+
+    # --------------------------------------------------------
+    # B) SEM-like void/solid combined zoom grid
+    # --------------------------------------------------------
+    sem_void_cmap = mcolors.ListedColormap([
+        "#C8C8C8",  # non-void polymer-like background
+        "#000000",  # void / deep pore
+    ])
+    sem_void_norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5], sem_void_cmap.N)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=COMBINED_FIGSIZE,
+        constrained_layout=False
+    )
+
+    if n_rows == 1:
+        axes = np.array([axes])
+
+    for r, tt in enumerate(snapshot_times):
+        for c, polymer_name in enumerate(polymer_order):
+            ax = axes[r, c]
+            phase = all_snapshots_by_polymer[polymer_name]["phase"][float(tt)]
+            phase_zoom = crop_center_square(phase)
+            void_zoom = np.where(phase_zoom == S_VOID, 1, 0)
+
+            ax.imshow(
+                void_zoom,
+                cmap=sem_void_cmap,
+                norm=sem_void_norm,
+                interpolation="nearest",
+                aspect="equal"
+            )
+
+            add_scale_bar_to_axis(
+                ax,
+                void_zoom.shape,
+                colour="white",
+                text_colour="white"
+            )
+
+            _format_axes(ax, tt, c, r, polymer_name)
+
+    add_bottom_legend(fig, binary_void_values={0, 1}, y_anchor=0.012)
+    plt.subplots_adjust(**COMBINED_ADJUST)
+
+    out_void = os.path.join(
+        combined_dir,
+        f"All_PCL_combined_void_zoom_grid_{ROWS}x{COLS}.png"
+    )
+    plt.savefig(out_void, dpi=600, bbox_inches="tight", pad_inches=0.02)
+    plt.show()
+    print(f"Saved combined void zoom grid: {out_void}")
+
+    # --------------------------------------------------------
+    # C) Species + enzyme overlay combined zoom grid
+    # --------------------------------------------------------
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=COMBINED_FIGSIZE,
+        constrained_layout=False
+    )
+
+    if n_rows == 1:
+        axes = np.array([axes])
+
+    for r, tt in enumerate(snapshot_times):
+        for c, polymer_name in enumerate(polymer_order):
+            ax = axes[r, c]
+            phase = all_snapshots_by_polymer[polymer_name]["phase"][float(tt)]
+            enzyme = all_snapshots_by_polymer[polymer_name]["enzyme"][float(tt)]
+
+            phase_zoom = crop_center_square(phase)
+            enzyme_zoom = crop_center_square(enzyme)
+
+            ax.imshow(
+                phase_zoom,
+                cmap=cmap_species,
+                norm=norm_species,
+                interpolation="nearest",
+                aspect="equal"
+            )
+
+            enzyme_alpha = np.clip(enzyme_zoom / E_BATH, 0.0, 1.0) * 0.55
+            ax.imshow(
+                np.ones_like(enzyme_zoom),
+                cmap=mcolors.ListedColormap([ENZYME_COLOUR]),
+                interpolation="nearest",
+                aspect="equal",
+                alpha=enzyme_alpha,
+                vmin=0,
+                vmax=1
+            )
+
+            add_scale_bar_to_axis(
+                ax,
+                phase_zoom.shape,
+                colour="white",
+                text_colour="white"
+            )
+
+            _format_axes(ax, tt, c, r, polymer_name)
+
+    add_bottom_legend(
+        fig,
+        present_states=present_states,
+        include_enzyme=True,
+        y_anchor=0.012
+    )
+    plt.subplots_adjust(**COMBINED_ADJUST)
+
+    out_overlay = os.path.join(
+        combined_dir,
+        f"All_PCL_combined_species_enzyme_zoom_grid_{ROWS}x{COLS}.png"
+    )
+    plt.savefig(out_overlay, dpi=600, bbox_inches="tight", pad_inches=0.02)
+    plt.show()
+    print(f"Saved combined species + enzyme zoom grid: {out_overlay}")
+
+    return {
+        "combined_species_zoom_grid": out_species,
+        "combined_void_zoom_grid": out_void,
+        "combined_species_enzyme_zoom_grid": out_overlay,
+    }
+
+
+# ============================================================
+# 11) MAIN: RUN SNAPSHOTS FOR ALL POLYMER GRADES
+# ============================================================
+if __name__ == "__main__":
+    print("\n================ FIXED PARAMETER SNAPSHOT SIMULATION ================")
+    print("Polymers: PCL6300, PCL6500, PCL6800")
+    print("No optimisation is performed.")
+    print("Parameters substituted from the refined 30 x 999 calibrated-parameter table supplied by the user.")
+    print("Output structure: remaining polymer, enzyme, void, oligomer, all-species overlay, plus SEM-style zoom snapshots.")
+    print(f"Snapshot times: {t_fit}")
+
+    names = [
+        "k1", "k3", "k_conv", "k_deg_C", "k_deg_A", "Mnc", "k_det",
+        "D_E_intact", "D_E_void_ratio", "D_O_poly", "D_O_void_ratio"
+    ]
+
+    all_summary_rows = []
+    all_snapshots_by_polymer = {}
+
+    for polymer_name in ["PCL6300", "PCL6500", "PCL6800"]:
+        CURRENT_POLYMER = polymer_name
+        data = ALL_POLYMER_DATA[polymer_name]
+        THETA_FIXED = ALL_THETA_FIXED[polymer_name]
+        MN0 = float(data["MN0"])
+        X_FIXED = float(data["X_FIXED"])
+
+        polymer_output_dir = os.path.join(OUTPUT_DIR, polymer_name)
+        os.makedirs(polymer_output_dir, exist_ok=True)
+
+        # Redirect all plotting/output helper functions to the polymer-specific folder.
+        old_output_dir = OUTPUT_DIR
+        OUTPUT_DIR = polymer_output_dir
+
+        print("\n" + "=" * 70)
+        print(f"RUNNING SNAPSHOTS FOR {polymer_name}")
+        print("=" * 70)
+        print(f"MN0 = {MN0:.2f} g/mol")
+        print(f"X_FIXED = {X_FIXED:.4f}")
+
+        print("\n================ FIXED PARAMETERS ================")
+        for nm, val in zip(names, THETA_FIXED):
+            if nm == "Mnc":
+                print(f"{nm:20s} = {val:.6e} g/mol")
+            else:
+                print(f"{nm:20s} = {val:.6e}")
+
+        t_snap, wl_snap, xc_snap, mn_snap, olig_snap, snapshots = run_hybrid(
+            theta=THETA_FIXED,
+            MW0=MN0,
+            chi=X_FIXED,
+            t_end=T_END,
+            seed=SEED,
+            record_times=t_fit,
+            return_snapshots=True
+        )
+
+        # Keep snapshots for the final SEM-style combined grid.
+        all_snapshots_by_polymer[polymer_name] = snapshots
+
+        output_files = plot_all_snapshot_types(snapshots, t_fit)
+        zoom_output_files = plot_sem_style_zoom_snapshots(snapshots, t_fit)
+        output_files.update(zoom_output_files)
+
+        save_snapshot_metrics(t_snap, wl_snap, xc_snap, mn_snap, olig_snap)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_path = os.path.join(
+            OUTPUT_DIR,
+            f"{CURRENT_POLYMER}_fixed_params_SEM_contrast_black_pores_summary_{timestamp}.tsv"
+        )
+
+        with open(summary_path, "w") as f:
+            f.write("parameter\tvalue\n")
+            for nm, val in zip(names, THETA_FIXED):
+                f.write(f"{nm}\t{val:.6e}\n")
+            f.write(f"SELECTED_POLYMER\t{CURRENT_POLYMER}\n")
+            f.write(f"MN0\t{MN0:.6e}\n")
+            f.write(f"X_FIXED\t{X_FIXED:.6e}\n")
+            f.write(f"PHI_WINDOW\t{PHI_WINDOW:d}\n")
+            f.write(f"M_SOL\t{M_SOL:d}\n")
+            f.write(f"FIELD_WIDTH_UM\t{FIELD_WIDTH_UM:.6e}\n")
+            f.write(f"SCALE_BAR_UM\t{SCALE_BAR_UM:.6e}\n")
+            f.write(f"ZOOM_SIZE_CELLS\t{ZOOM_SIZE_CELLS:d}\n")
+            f.write(f"ZOOM_FIELD_WIDTH_UM\t{ZOOM_FIELD_WIDTH_UM:.6e}\n")
+            f.write(f"ROWS\t{ROWS:d}\n")
+            f.write(f"COLS\t{COLS:d}\n")
+            f.write(f"DX\t{DX:.6e}\n")
+            f.write(f"L_Y\t{L_Y:.6e}\n")
+            f.write(f"L_X\t{L_X:.6e}\n")
+            f.write("simulation_type\tfixed_parameter_snapshot_run\n")
+            f.write("snapshot_structure\tremaining_polymer_enzyme_void_oligomer_all_species_overlay\n")
+            f.write("erosion_rule\tboundary_S_DEG_immediately_eligible_probabilistic_erosion_interior_S_DEG_requires_Mn_less_equal_Mnc_and_von_Neumann_enzyme\n")
+            f.write("mass_loss_formula\t1_minus_sum_mC_mA_mD_mO_inside_divided_by_total_cells\n")
+            f.write("crystallinity_formula\tmC_divided_by_mC_plus_mA_plus_mD_plus_mO_inside\n")
+            for key, path in output_files.items():
+                f.write(f"output_{key}\t{path}\n")
+
+        print(f"Saved summary: {summary_path}")
+
+        for tt, wl, xc, mn, olig in zip(t_snap, wl_snap, xc_snap, mn_snap, olig_snap):
+            all_summary_rows.append({
+                "polymer": polymer_name,
+                "time_h": float(tt),
+                "weight_loss_percent": 100.0 * float(wl),
+                "remaining_crystallinity_percent": 100.0 * float(xc),
+                "Mn_global_g_mol": float(mn),
+                "oligomer_inside_percent": 100.0 * float(olig),
+            })
+
+        OUTPUT_DIR = old_output_dir
+
+    # After the three individual simulations, put the zoom snapshots together
+    # in one panel like the experimental SEM figure.
+    combined_zoom_files = plot_combined_zoom_snapshot_grid(all_snapshots_by_polymer, t_fit)
+
+    combined_metrics_path = os.path.join(OUTPUT_DIR, "all_PCL_snapshot_metrics.xlsx")
+    pd.DataFrame(all_summary_rows).to_excel(combined_metrics_path, index=False)
+    print(f"\nSaved combined metrics Excel: {combined_metrics_path}")
+    print("\nDone.")
