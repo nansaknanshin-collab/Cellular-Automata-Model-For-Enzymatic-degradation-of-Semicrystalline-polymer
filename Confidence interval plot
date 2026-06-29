@@ -1,0 +1,398 @@
+function plot_parameterwise_CI_comparison_two_pages()
+
+clc;
+close all;
+
+% ============================================================
+% NINE-PARAMETER NO-AMORPHISATION MODEL
+%
+% Parameter order:
+% [k1, k3, k_deg_C, k_deg_A, Mnc, k_det, D_E0, alpha, beta_phi]
+%
+% Required CSV files in Downloads\ci:
+% posterior_samples_6300.csv
+% posterior_samples_6500.csv
+% posterior_samples_6800.csv
+% ============================================================
+
+grades = {'PCL 6300', 'PCL 6500', 'PCL 6800'};
+x = 1:numel(grades);
+
+requiredVariables = { ...
+'k1', ...
+'k3', ...
+'k_deg_C', ...
+'k_deg_A', ...
+'Mnc', ...
+'k_det', ...
+'D_E0', ...
+'alpha', ...
+'beta_phi'};
+
+paramLatex = { ...
+'k_1', ...
+'k_3', ...
+'k_{\mathrm{deg},C}', ...
+'k_{\mathrm{deg},A}', ...
+'M_{\mathrm{nc}}', ...
+'k_{\mathrm{det}}', ...
+'D_{E0}', ...
+'\alpha', ...
+'\beta_{\phi}'};
+
+% Legend labels: parameter symbol only.
+ciLegendNames = cell(size(paramLatex));
+
+for p = 1:numel(paramLatex)
+ciLegendNames{p} = ['$' paramLatex{p} '$'];
+end
+
+meanLegendName = 'Posterior mean';
+
+paramColors = [
+0.0000 0.4470 0.7410;
+0.8500 0.3250 0.0980;
+0.9290 0.6940 0.1250;
+0.4940 0.1840 0.5560;
+0.4660 0.6740 0.1880;
+0.3010 0.7450 0.9330;
+0.6350 0.0780 0.1840;
+0.0000 0.4470 0.7410;
+0.8500 0.3250 0.0980
+];
+
+% ============================================================
+% INPUT / OUTPUT FOLDERS
+% ============================================================
+
+if ispc
+downloadsDir = fullfile(getenv('USERPROFILE'), 'Downloads');
+else
+downloadsDir = fullfile(getenv('HOME'), 'Downloads');
+end
+
+dataDir = fullfile(downloadsDir, 'ci');
+
+if ~isfolder(dataDir)
+error(['Posterior-sample folder was not found:\n%s\n\n' ...
+'Create this folder and place the three CSV files inside it.'], ...
+dataDir);
+end
+
+outputDir = dataDir;
+
+% ============================================================
+% FIXED FILE-TO-GRADE MAPPING
+% ============================================================
+
+posteriorCsvFiles = {
+findSinglePosteriorCsv(dataDir, 'posterior_samples_6300');
+findSinglePosteriorCsv(dataDir, 'posterior_samples_6500');
+findSinglePosteriorCsv(dataDir, 'posterior_samples_6800')
+};
+
+fprintf('\n============================================================\n');
+fprintf('FIXED POSTERIOR-SAMPLE FILE MAPPING\n');
+fprintf('============================================================\n');
+
+for g = 1:numel(grades)
+fprintf('%s:\n%s\n\n', grades{g}, posteriorCsvFiles{g});
+end
+
+% ============================================================
+% READ POSTERIOR SAMPLES AND COMPUTE POSTERIOR STATISTICS
+% ============================================================
+
+nGrades = numel(grades);
+nParams = numel(requiredVariables);
+
+means = zeros(nGrades, nParams);
+ciLow = zeros(nGrades, nParams);
+ciHigh = zeros(nGrades, nParams);
+
+posteriorSummary = table();
+
+for g = 1:nGrades
+
+
+T = readtable( ...
+    posteriorCsvFiles{g}, ...
+    'VariableNamingRule', 'preserve');
+
+missingVariables = setdiff( ...
+    requiredVariables, ...
+    T.Properties.VariableNames);
+
+if ~isempty(missingVariables)
+    error('%s is missing the required columns:\n%s', ...
+        posteriorCsvFiles{g}, ...
+        strjoin(missingVariables, ', '));
+end
+
+samples = T{:, requiredVariables};
+
+if ~isnumeric(samples)
+    error('Posterior samples in %s are not numeric.', ...
+        posteriorCsvFiles{g});
+end
+
+validRows = all(isfinite(samples), 2);
+samples = samples(validRows, :);
+
+if isempty(samples)
+    error('No finite posterior samples remain in:\n%s', ...
+        posteriorCsvFiles{g});
+end
+
+% Posterior statistics used directly in the plots.
+means(g, :) = mean(samples, 1);
+ciLow(g, :) = prctile(samples, 2.5, 1);
+ciHigh(g, :) = prctile(samples, 97.5, 1);
+
+fprintf('\n============================================================\n');
+fprintf('%s POSTERIOR SUMMARY\n', grades{g});
+fprintf('Source CSV: %s\n', posteriorCsvFiles{g});
+fprintf('Finite posterior samples: %d\n', size(samples, 1));
+
+gradeSummary = table( ...
+    requiredVariables', ...
+    means(g, :)', ...
+    ciLow(g, :)', ...
+    ciHigh(g, :)', ...
+    'VariableNames', { ...
+        'Parameter', ...
+        'PosteriorMean', ...
+        'CrI_Lower_2p5', ...
+        'CrI_Upper_97p5'});
+
+disp(gradeSummary);
+
+polymerColumn = repmat(grades(g), nParams, 1);
+
+tempSummary = table( ...
+    polymerColumn, ...
+    requiredVariables', ...
+    means(g, :)', ...
+    ciLow(g, :)', ...
+    ciHigh(g, :)', ...
+    'VariableNames', { ...
+        'Polymer', ...
+        'Parameter', ...
+        'PosteriorMean', ...
+        'CrI_Lower_2p5', ...
+        'CrI_Upper_97p5'});
+
+posteriorSummary = [posteriorSummary; tempSummary]; %#ok<AGROW>
+
+end
+
+% ============================================================
+% CONSISTENCY CHECK AGAINST EXPECTED POSTERIOR MEANS
+% The figure values still come directly from the CSV files.
+% ============================================================
+
+expectedMeans = [
+0.66239378, 3.7156200, 0.48740737, 1.3179059,  7271.2531, 2.4362611, 17.4336440, 26.150305, 44.371887;
+0.83079479, 4.5395723, 0.48294011, 2.5188165, 10405.2010, 2.1472137,  4.2005489, 23.591400, 34.273782;
+0.70485985, 3.9734830, 0.45245834, 2.4571543, 14434.6760, 1.9242016, 17.3660000, 24.799885, 38.248462
+];
+
+relativeDifference = abs(means - expectedMeans) ./ max(abs(expectedMeans), 1.0);
+maximumRelativeDifference = max(relativeDifference(:));
+
+fprintf('\n============================================================\n');
+fprintf('TABLE CONSISTENCY CHECK\n');
+fprintf('============================================================\n');
+fprintf('Maximum relative difference: %.3e\n', maximumRelativeDifference);
+
+if maximumRelativeDifference <= 1e-4
+fprintf('PASS: CSV-derived posterior means agree with the manuscript table.\n');
+else
+warning(['CSV-derived means do not agree closely with the expected ' ...
+'posterior means. Check the files in Downloads\ci.']);
+end
+
+% ============================================================
+% SAVE CSV-DERIVED POSTERIOR SUMMARY
+% ============================================================
+
+timestamp = datestr(now, 'yyyymmdd_HHMMSS');
+
+summaryFile = fullfile(outputDir, ...
+['no_amorphisation_posterior_summary_' timestamp '.csv']);
+
+writetable(posteriorSummary, summaryFile);
+
+fprintf('\nPosterior summary saved to:\n%s\n', summaryFile);
+
+% ============================================================
+% PAGE 1: KINETIC AND EROSION PARAMETERS
+% ============================================================
+
+plotPage( ...
+[1, 2, 3, 4, 6], ...
+['parameterwise_CI_page1_no_amorphisation_kinetic_erosion_' timestamp], ...
+grades, x, ciLegendNames, meanLegendName, ...
+paramColors, means, ciLow, ciHigh, outputDir);
+
+% ============================================================
+% PAGE 2: MOLECULAR-WEIGHT AND TRANSPORT PARAMETERS
+% ============================================================
+
+plotPage( ...
+[5, 7, 8, 9], ...
+['parameterwise_CI_page2_no_amorphisation_transport_porosity_' timestamp], ...
+grades, x, ciLegendNames, meanLegendName, ...
+paramColors, means, ciLow, ciHigh, outputDir);
+
+end
+
+function plotPage(paramIdx, outName, grades, x, ciLegendNames, ...
+meanLegendName, paramColors, means, ciLow, ciHigh, ...
+outputDir)
+
+fig = figure( ...
+'Color', 'w', ...
+'Units', 'normalized', ...
+'Position', [0.05 0.05 0.90 0.85]);
+
+if numel(paramIdx) == 5
+tiledlayout(2, 3, 'TileSpacing', 'loose', 'Padding', 'loose');
+else
+tiledlayout(2, 2, 'TileSpacing', 'loose', 'Padding', 'loose');
+end
+
+for ii = 1:numel(paramIdx)
+
+
+p = paramIdx(ii);
+
+ax = nexttile;
+hold(ax, 'on');
+box(ax, 'on');
+grid(ax, 'on');
+
+yMean = means(:, p);
+yLow = ciLow(:, p);
+yHigh = ciHigh(:, p);
+
+thisColor = paramColors(p, :);
+
+% Dummy handles are used only for the legend.
+hCI = plot(ax, nan, nan, 's', ...
+    'MarkerSize', 11, ...
+    'MarkerFaceColor', thisColor, ...
+    'MarkerEdgeColor', thisColor, ...
+    'LineStyle', 'none');
+
+hMean = plot(ax, nan, nan, 'r-', ...
+    'LineWidth', 4);
+
+% Coloured 95% posterior credible intervals.
+for g = 1:numel(grades)
+    plot(ax, [x(g), x(g)], [yLow(g), yHigh(g)], ...
+        'LineWidth', 18, ...
+        'Color', thisColor, ...
+        'HandleVisibility', 'off');
+end
+
+% Red horizontal posterior-mean markers.
+plot(ax, x, yMean, 'r_', ...
+    'MarkerSize', 36, ...
+    'LineWidth', 5, ...
+    'HandleVisibility', 'off');
+
+xlim(ax, [0.35, 3.65]);
+xticks(ax, x);
+xticklabels(ax, grades);
+xtickangle(ax, 15);
+
+if p == 5
+    ylabel(ax, '$M_{\mathrm{nc}}$ (g/mol)', ...
+        'Interpreter', 'latex', ...
+        'FontSize', 20, ...
+        'FontWeight', 'bold');
+else
+    ylabel(ax, 'Parameter value', ...
+        'FontSize', 20, ...
+        'FontWeight', 'bold');
+end
+
+% Compact, vertical legend with no CrI or percentage text.
+lgd = legend(ax, [hCI, hMean], ...
+    {ciLegendNames{p}, meanLegendName}, ...
+    'Interpreter', 'latex', ...
+    'Location', 'northoutside', ...
+    'Orientation', 'vertical', ...
+    'FontSize', 14, ...
+    'Box', 'off');
+
+lgd.FontName = 'Times New Roman';
+lgd.FontWeight = 'bold';
+
+try
+    lgd.NumColumns = 1;
+catch
+end
+
+try
+    lgd.ItemTokenSize = [14, 9];
+catch
+end
+
+set(ax, ...
+    'FontName', 'Times New Roman', ...
+    'FontSize', 17, ...
+    'FontWeight', 'bold', ...
+    'LineWidth', 1.8);
+
+yMin = min(yLow);
+yMax = max(yHigh);
+
+pad = 0.16 * (yMax - yMin);
+
+if pad == 0
+    pad = 0.1;
+end
+
+ylim(ax, [max(0, yMin - pad), yMax + pad]);
+
+
+end
+
+allAxes = findall(fig, 'Type', 'axes');
+
+for i = 1:numel(allAxes)
+if isprop(allAxes(i), 'Toolbar')
+allAxes(i).Toolbar.Visible = 'off';
+end
+end
+
+pngFile = fullfile(outputDir, [outName '.png']);
+figFile = fullfile(outputDir, [outName '.fig']);
+
+exportgraphics(fig, pngFile, 'Resolution', 600);
+savefig(fig, figFile);
+
+fprintf('\nSaved figure files:\n%s\n%s\n', pngFile, figFile);
+
+end
+
+function csvPath = findSinglePosteriorCsv(dataDir, fileStem)
+
+files = dir(fullfile(dataDir, [fileStem '*.csv']));
+
+if isempty(files)
+error('No CSV file was found matching:\n%s', ...
+fullfile(dataDir, [fileStem '*.csv']));
+end
+
+if numel(files) > 1
+error(['More than one CSV file matches:\n%s\n\n' ...
+'Keep only one CSV file for this grade.'], ...
+fullfile(dataDir, [fileStem '*.csv']));
+end
+
+csvPath = fullfile(files(1).folder, files(1).name);
+
+end
